@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+DATA_SOURCE_MODE = os.getenv("DATA_SOURCE_MODE", "mock").lower()
+
 # ============ CONFIG ============
 app = FastAPI(
     title="ForaGo API",
@@ -24,10 +26,11 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:*",
+        "http://localhost",
+        "http://127.0.0.1",
         "https://forago.app",
-        "https://*.forago.pages.dev",
     ],
+    allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)*forago\.pages\.dev$|^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -98,9 +101,52 @@ MOCK_FINDS = {
         date=datetime.now(),
         categoryPaths=[["edible", "mushroom", "porcini"]],
         description="Porcini mushrooms found",
-        clusterHash="51.5_-0.1",
+        clusterHash="48.71_19.15",
     ),
 }
+
+
+def _public_records_from_mock() -> List[PublicFindRecord]:
+    return [
+        find
+        for find in MOCK_FINDS.values()
+        if isinstance(find, PublicFindRecord)
+        and not isinstance(find, PrivateFindRecord)
+    ]
+
+
+def _private_records_from_mock() -> List[PrivateFindRecord]:
+    return [
+        find for find in MOCK_FINDS.values() if isinstance(find, PrivateFindRecord)
+    ]
+
+
+def _matches_category_filter(record: PublicFindRecord, category: Optional[str]) -> bool:
+    if not category:
+        return True
+
+    segments = [segment for segment in category.split("/") if segment]
+    if not segments:
+        return True
+
+    for path in record.categoryPaths:
+        if len(path) < len(segments):
+            continue
+        if path[: len(segments)] == segments:
+            return True
+    return False
+
+
+def _matches_date_filter(
+    record: PublicFindRecord,
+    from_date: Optional[datetime],
+    to_date: Optional[datetime],
+) -> bool:
+    if from_date and record.date < from_date:
+        return False
+    if to_date and record.date > to_date:
+        return False
+    return True
 
 # ============ ROUTES ============
 
@@ -110,7 +156,8 @@ async def health_check():
     return {
         "status": "ok",
         "timestamp": datetime.utcnow(),
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "dataSourceMode": DATA_SOURCE_MODE,
     }
 
 # ---------- FINDS ENDPOINTS ----------
@@ -126,15 +173,22 @@ async def get_public_finds(
     Get all public finds (visible to all users)
     Filter by cluster, category, date range
     """
-    # TODO: Query from PostgreSQL
-    # For now: return mock data filtered
-    results = [
-        find for find in MOCK_FINDS.values()
-        if isinstance(find, PublicFindRecord)
-    ]
+    if DATA_SOURCE_MODE == "db":
+        raise HTTPException(
+            status_code=501,
+            detail="DB mode is not implemented yet. Switch DATA_SOURCE_MODE=mock.",
+        )
+
+    results = _public_records_from_mock()
     
     if cluster:
         results = [f for f in results if f.clusterHash == cluster]
+
+    if category:
+        results = [f for f in results if _matches_category_filter(f, category)]
+
+    if from_date or to_date:
+        results = [f for f in results if _matches_date_filter(f, from_date, to_date)]
     
     return results
 
@@ -142,12 +196,28 @@ async def get_public_finds(
 async def get_finds_nearby(
     cluster: str,
     category: Optional[str] = None,
+    from_date: Optional[datetime] = None,
+    to_date: Optional[datetime] = None,
 ):
     """Get finds near a specific cluster"""
+    if DATA_SOURCE_MODE == "db":
+        raise HTTPException(
+            status_code=501,
+            detail="DB mode is not implemented yet. Switch DATA_SOURCE_MODE=mock.",
+        )
+
     results = [
-        find for find in MOCK_FINDS.values()
-        if isinstance(find, PublicFindRecord) and find.clusterHash == cluster
+        find
+        for find in _public_records_from_mock()
+        if find.clusterHash == cluster
     ]
+
+    if category:
+        results = [f for f in results if _matches_category_filter(f, category)]
+
+    if from_date or to_date:
+        results = [f for f in results if _matches_date_filter(f, from_date, to_date)]
+
     return results
 
 @app.get("/api/finds/private", response_model=List[PrivateFindRecord])
@@ -159,11 +229,14 @@ async def get_private_finds(
     Get current user's private finds
     Requires authentication
     """
-    # TODO: Filter by current_user.id
-    results = [
-        find for find in MOCK_FINDS.values()
-        if isinstance(find, PrivateFindRecord)
-    ]
+    if DATA_SOURCE_MODE == "db":
+        raise HTTPException(
+            status_code=501,
+            detail="DB mode is not implemented yet. Switch DATA_SOURCE_MODE=mock.",
+        )
+
+    # TODO: Filter by current_user.id once auth is wired.
+    results = _private_records_from_mock()
     return results
 
 @app.post("/api/finds", response_model=PrivateFindRecord, status_code=status.HTTP_201_CREATED)
@@ -175,8 +248,12 @@ async def create_find(
     Create new find record
     Returns PrivateFindRecord with exact location
     """
-    # TODO: Save to PostgreSQL
-    # For now: return mock
+    if DATA_SOURCE_MODE == "db":
+        raise HTTPException(
+            status_code=501,
+            detail="DB mode is not implemented yet. Switch DATA_SOURCE_MODE=mock.",
+        )
+
     new_find = PrivateFindRecord(
         id=f"rec_{len(MOCK_FINDS) + 1:03d}",
         userId="user_current",  # TODO: from JWT token
@@ -238,7 +315,12 @@ async def get_clusters(
     Get aggregated cluster data
     Returns cluster stats without revealing exact locations
     """
-    # TODO: Query from PostgreSQL (GROUP BY cluster_hash)
+    if DATA_SOURCE_MODE == "db":
+        raise HTTPException(
+            status_code=501,
+            detail="DB mode is not implemented yet. Switch DATA_SOURCE_MODE=mock.",
+        )
+
     clusters = {
         "51.5_-0.1": PublicClusterRecord(
             clusterHash="51.5_-0.1",
@@ -271,8 +353,9 @@ async def startup():
     print("🚀 ForaGo API started")
     print(f"📖 Docs: http://localhost:8000/docs")
     print(f"🔧 ReDoc: http://localhost:8000/redoc")
-    # TODO: Connect to PostgreSQL
-    # TODO: Run migrations
+    print(f"🗂️ Data source mode: {DATA_SOURCE_MODE}")
+    # TODO: Connect to PostgreSQL when DATA_SOURCE_MODE=db.
+    # TODO: Run migrations.
 
 if __name__ == "__main__":
     import uvicorn
