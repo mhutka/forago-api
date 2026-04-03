@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS finds (
 );
 
 -- Indexes for common queries
-CREATE INDEX idx_finds_user_id ON finds(user_id);
-CREATE INDEX idx_finds_cluster_hash ON finds(cluster_hash);
-CREATE INDEX idx_finds_date ON finds(date);
-CREATE INDEX idx_finds_user_id_cluster ON finds(user_id, cluster_hash);
+CREATE INDEX IF NOT EXISTS idx_finds_user_id ON finds(user_id);
+CREATE INDEX IF NOT EXISTS idx_finds_cluster_hash ON finds(cluster_hash);
+CREATE INDEX IF NOT EXISTS idx_finds_date ON finds(date);
+CREATE INDEX IF NOT EXISTS idx_finds_user_id_cluster ON finds(user_id, cluster_hash);

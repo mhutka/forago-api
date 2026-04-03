@@ -74,9 +74,12 @@ python main.py
 
 ### Step 5: Test Endpoints
 
-**Create a find record:**
+**Create a find record (authenticated):**
 ```bash
+export TOKEN="<jwt-with-sub-uuid>"
+
 curl -X POST http://localhost:8000/api/finds \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "date": "2026-03-25T10:00:00Z",
@@ -97,9 +100,10 @@ curl http://localhost:8000/api/finds/public
 curl http://localhost:8000/api/finds/public?cluster=48.14_17.11
 ```
 
-**Get private records for a user:**
+**Get private records for current user:**
 ```bash
-curl http://localhost:8000/api/finds/private?user_id=user_jan
+curl http://localhost:8000/api/finds/private \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ## Troubleshooting
@@ -160,9 +164,45 @@ If using Supabase instead of local PostgreSQL:
    ```
 4. Supabase will auto-run migrations (SQL executed as-is)
 
+## Supabase Auth (JWT) Integration
+
+Backend now validates Bearer JWT for private endpoints.
+
+Recommended `.env` setup for Supabase Auth:
+```
+SUPABASE_URL=https://<project-ref>.supabase.co
+JWT_ALGORITHMS=RS256
+JWT_JWKS_URL=https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json
+JWT_ISSUER=https://<project-ref>.supabase.co/auth/v1
+SUPABASE_JWT_AUDIENCE=authenticated
+```
+
+If your Supabase project uses HS256 secret tokens, use:
+```
+JWT_ALGORITHMS=HS256
+JWT_SECRET_KEY=<supabase-jwt-secret>
+JWT_ISSUER=https://<project-ref>.supabase.co/auth/v1
+SUPABASE_JWT_AUDIENCE=authenticated
+```
+
+Quick check with a real access token from Flutter/Supabase login:
+```bash
+curl http://localhost:8000/api/auth/me \
+  -H "Authorization: Bearer <access_token>"
+```
+
+Expected response:
+```json
+{
+  "userId": "<supabase-user-uuid>",
+  "issuer": "https://<project-ref>.supabase.co/auth/v1",
+  "audience": "authenticated"
+}
+```
+
 ## Next Steps
 
 - [ ] Add test data to `finds` table
 - [ ] Implement DELETE/UPDATE endpoints (currently stub)
-- [ ] Add JWT authentication
+- [x] Add JWT authentication
 - [ ] Fetch images and comments from related tables

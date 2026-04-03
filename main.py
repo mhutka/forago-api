@@ -5,6 +5,7 @@ Main application file with routes
 
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel, field_validator
@@ -13,6 +14,7 @@ from dotenv import load_dotenv
 import asyncio
 
 from database import init_db, close_db, run_migrations
+from auth import AuthUser, get_current_user, validate_auth_configuration
 from queries import (
     query_public_finds,
     query_private_finds,
@@ -27,15 +29,18 @@ from queries import (
 load_dotenv()
 
 DATA_SOURCE_MODE = os.getenv("DATA_SOURCE_MODE", "mock").lower()
-# AUTH-TEMP: Remove this dev fallback once real JWT authentication is wired.
-AUTH_DEV_USER_ID = os.getenv("AUTH_DEV_USER_ID", "00000000-0000-0000-0000-000000000001")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
 
 
-def _resolve_dev_user_id(user_id: Optional[str] = None) -> str:
-    """AUTH-TEMP: map missing/dev placeholder user IDs to a valid UUID for local DB testing."""
-    if not user_id or user_id == "user_current":
-        return AUTH_DEV_USER_ID
-    return user_id
+def _is_production_env() -> bool:
+    return ENVIRONMENT in {"production", "prod"}
+
+
+def _validate_startup_configuration() -> None:
+    if _is_production_env() and DATA_SOURCE_MODE != "db":
+        raise RuntimeError("Production requires DATA_SOURCE_MODE=db")
+
+    validate_auth_configuration(is_production=_is_production_env())
 
 # ============ CONFIG ============
 app = FastAPI(
@@ -93,6 +98,12 @@ class PublicClusterRecord(BaseModel):
     categoryPathCounts: dict
     totalRecords: int
     lastUpdated: datetime
+
+
+class AuthMeResponse(BaseModel):
+    userId: str
+    issuer: Optional[str] = None
+    audience: Optional[str] = None
 
 VALID_PERIODS = {
     "JAN_1", "JAN_2", "FEB_1", "FEB_2", "MAR_1", "MAR_2",
@@ -205,6 +216,26 @@ def _matches_period_filter(record: PublicFindRecord, period: Optional[str]) -> b
 
 # ============ ROUTES ============
 
+@app.get("/api/auth/me", response_model=AuthMeResponse)
+async def auth_me(current_user: AuthUser = Depends(get_current_user)):
+    """Return identity resolved from Bearer token."""
+    claims = current_user.claims
+    audience = claims.get("aud")
+    if isinstance(audience, list):
+        audience = ",".join(audience)
+    if audience is not None and not isinstance(audience, str):
+        audience = str(audience)
+
+    issuer = claims.get("iss")
+    if issuer is not None and not isinstance(issuer, str):
+        issuer = str(issuer)
+
+    return AuthMeResponse(
+        userId=current_user.user_id,
+        issuer=issuer,
+        audience=audience,
+    )
+
 @app.get("/api/health")
 async def health_check():
     """Health check - used by monitoring"""
@@ -307,21 +338,19 @@ async def get_finds_nearby(
 
 @app.get("/api/finds/private", response_model=List[PrivateFindRecord])
 async def get_private_finds(
-    user_id: Optional[str] = None,
     cluster: Optional[str] = None,
     category: Optional[str] = None,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
-    # AUTH-TEMP: Remove user_id query param after JWT auth is wired.
-    # current_user: str = Depends(get_current_user)
+    current_user: AuthUser = Depends(get_current_user),
 ):
     """
     Get current user's private finds
     Requires authentication
     """
     try:
-        effective_user_id = _resolve_dev_user_id(user_id)
+        effective_user_id = current_user.user_id
 
         if DATA_SOURCE_MODE == "db":
             results_data = await query_private_finds(
@@ -361,14 +390,14 @@ async def get_private_finds(
 @app.post("/api/finds", response_model=PrivateFindRecord, status_code=status.HTTP_201_CREATED)
 async def create_find(
     request: CreateFindRequest,
-    # AUTH-TEMP: Replace with current_user from JWT auth.
+    current_user: AuthUser = Depends(get_current_user),
 ):
     """
     Create new find record
     Returns PrivateFindRecord with exact location
     """
     try:
-        effective_user_id = _resolve_dev_user_id()
+        effective_user_id = current_user.user_id
 
         if DATA_SOURCE_MODE == "db":
             result_data = await insert_find(
@@ -403,11 +432,11 @@ async def create_find(
         )
 
 @app.get("/api/finds/{find_id}", response_model=PrivateFindRecord)
-async def get_find(find_id: str):
+async def get_find(find_id: str, current_user: AuthUser = Depends(get_current_user)):
     """Get find by ID (if user has access)"""
     try:
         if DATA_SOURCE_MODE == "db":
-            result = await get_find_by_id(find_id)
+            result = await get_find_by_id(find_id, current_user.user_id)
             if result is None:
                 raise HTTPException(status_code=404, detail="Find not found")
             return PrivateFindRecord(**result)
@@ -415,7 +444,7 @@ async def get_find(find_id: str):
             if find_id not in MOCK_FINDS:
                 raise HTTPException(status_code=404, detail="Find not found")
             record = MOCK_FINDS[find_id]
-            if isinstance(record, PrivateFindRecord):
+            if isinstance(record, PrivateFindRecord) and record.userId == current_user.user_id:
                 return record
             raise HTTPException(status_code=403, detail="Access denied")
     except HTTPException:
@@ -427,13 +456,14 @@ async def get_find(find_id: str):
 async def update_find(
     find_id: str,
     request: UpdateFindRequest,
-    # AUTH-TEMP: Replace with current_user ownership checks from JWT auth.
+    current_user: AuthUser = Depends(get_current_user),
 ):
     """Update find"""
     try:
         if DATA_SOURCE_MODE == "db":
             result = await db_update_find(
                 find_id=find_id,
+                user_id=current_user.user_id,
                 date=request.date,
                 description=request.description,
                 latitude=request.location.latitude if request.location else None,
@@ -448,7 +478,7 @@ async def update_find(
             if find_id not in MOCK_FINDS:
                 raise HTTPException(status_code=404, detail="Find not found")
             existing = MOCK_FINDS[find_id]
-            if not isinstance(existing, PrivateFindRecord):
+            if not isinstance(existing, PrivateFindRecord) or existing.userId != current_user.user_id:
                 raise HTTPException(status_code=403, detail="Access denied")
             updated = existing.model_copy(update={
                 k: v for k, v in {
@@ -467,19 +497,21 @@ async def update_find(
         raise HTTPException(status_code=500, detail=f"Failed to update find: {str(e)}")
 
 @app.delete("/api/finds/{find_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_find(find_id: str):
+async def delete_find(find_id: str, current_user: AuthUser = Depends(get_current_user)):
     """Delete find.
 
-    AUTH-TEMP: add ownership checks once JWT auth is wired.
+    Requires authentication and ownership.
     """
     try:
         if DATA_SOURCE_MODE == "db":
-            deleted = await db_delete_find(find_id)
+            deleted = await db_delete_find(find_id, current_user.user_id)
             if not deleted:
                 raise HTTPException(status_code=404, detail="Find not found")
         else:
             if find_id not in MOCK_FINDS:
                 raise HTTPException(status_code=404, detail="Find not found")
+            if not isinstance(MOCK_FINDS[find_id], PrivateFindRecord) or MOCK_FINDS[find_id].userId != current_user.user_id:
+                raise HTTPException(status_code=403, detail="Access denied")
             del MOCK_FINDS[find_id]
     except HTTPException:
         raise
@@ -527,17 +559,22 @@ async def get_clusters(
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
     """Custom error response"""
-    return {
-        "error": exc.detail,
-        "status": exc.status_code,
-        "timestamp": datetime.utcnow(),
-    }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status": exc.status_code,
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+    )
 
 # ============ STARTUP / SHUTDOWN ============
 
 @app.on_event("startup")
 async def startup():
     """Initialize on startup"""
+    _validate_startup_configuration()
+
     print("🚀 ForaGo API started")
     print(f"📖 Docs: http://localhost:8000/docs")
     print(f"🔧 ReDoc: http://localhost:8000/redoc")

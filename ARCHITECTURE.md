@@ -9,7 +9,7 @@ FastAPI + PostgreSQL backend for ForaGo bushcraft finding app. Dual-mode operati
 - **Database**: PostgreSQL + asyncpg (async driver)
 - **ORM**: Raw SQL via asyncpg (no ORM for query control)
 - **Validation**: Pydantic v2
-- **Auth**: JWT (planned, not yet wired)
+- **Auth**: JWT Bearer validation (wired for private endpoints)
 
 ## Project Structure
 
@@ -57,7 +57,7 @@ MOCK_FINDS = {
 
 2. **Finds Endpoints** (main API)
    - `GET /api/finds/public` → List[PublicFindRecord]
-   - `GET /api/finds/private?user_id=X` → List[PrivateFindRecord]
+    - `GET /api/finds/private` (Bearer token required) → List[PrivateFindRecord]
    - `GET /api/finds/nearby?cluster=X` → List[PublicFindRecord]
    - `POST /api/finds` → PrivateFindRecord (create)
    - `GET /api/finds/{id}` → PrivateFindRecord (get one)
@@ -246,7 +246,7 @@ async def get_public_finds(cluster: Optional[str] = None, ...):
 - `201 Created` — Successful POST /api/finds
 - `204 No Content` — Successful DELETE
 - `400 Bad Request` — Client error (invalid params)
-- `403 Forbidden` — User doesn't own record (future, with JWT)
+- `403 Forbidden` — User doesn't own record
 - `404 Not Found` — Record doesn't exist
 - `500 Internal Server Error` — DB query failed, unhandled exception
 - `501 Not Implemented` — Feature not yet coded

@@ -79,9 +79,16 @@ async def run_migrations():
                 print(f"✓ {filename} executed")
             except Exception as e:
                 print(f"✗ {filename} failed: {e}")
+                raise
 
 
 async def get_db_connection():
     """Get a single connection from the pool (for use in routes)."""
     pool = get_pool()
     return await pool.acquire()
+
+
+async def release_db_connection(conn):
+    """Release a pooled connection acquired via get_db_connection()."""
+    pool = get_pool()
+    await pool.release(conn)

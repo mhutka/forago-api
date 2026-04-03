@@ -10,4 +10,4 @@ CREATE TABLE IF NOT EXISTS find_images (
 );
 
 -- Index for find lookups
-CREATE INDEX idx_find_images_find_id ON find_images(find_id);
+CREATE INDEX IF NOT EXISTS idx_find_images_find_id ON find_images(find_id);

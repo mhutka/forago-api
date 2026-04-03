@@ -10,5 +10,5 @@ CREATE TABLE IF NOT EXISTS find_comments (
 );
 
 -- Indexes for common queries
-CREATE INDEX idx_find_comments_find_id ON find_comments(find_id);
-CREATE INDEX idx_find_comments_user_id ON find_comments(user_id);
+CREATE INDEX IF NOT EXISTS idx_find_comments_find_id ON find_comments(find_id);
+CREATE INDEX IF NOT EXISTS idx_find_comments_user_id ON find_comments(user_id);
