@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: forago-backend-staging
+    runtime: python
+    rootDir: .
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATA_SOURCE_MODE
+        value: db
+      - key: DEBUG
+        value: false
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: 5432
+      - key: DB_NAME
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_JWT_AUDIENCE
+        value: authenticated
+      - key: JWT_ALGORITHMS
+        value: RS256
+      - key: JWT_ISSUER
+        sync: false
+      - key: JWT_JWKS_URL
+        sync: false

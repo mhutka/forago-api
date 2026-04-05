@@ -32,6 +32,23 @@ DATA_SOURCE_MODE = os.getenv("DATA_SOURCE_MODE", "mock").lower()
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
 
 
+def _parse_cors_origins() -> List[str]:
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+    if not raw:
+        return [
+            "http://localhost",
+            "http://127.0.0.1",
+            "https://forago.app",
+        ]
+
+    origins = [item.strip() for item in raw.split(",") if item.strip()]
+    return origins or [
+        "http://localhost",
+        "http://127.0.0.1",
+        "https://forago.app",
+    ]
+
+
 def _is_production_env() -> bool:
     return ENVIRONMENT in {"production", "prod"}
 
@@ -52,11 +69,7 @@ app = FastAPI(
 # CORS settings - allow Flutter (localhost:port) and web (Cloudflare Pages)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost",
-        "http://127.0.0.1",
-        "https://forago.app",
-    ],
+    allow_origins=_parse_cors_origins(),
     allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)*forago\.pages\.dev$|^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
