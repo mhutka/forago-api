@@ -14,6 +14,18 @@ DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "forago")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
+
+
+def _resolve_db_ssl() -> bool:
+    """Resolve DB SSL mode from env, defaulting to enabled in production."""
+    raw_value = os.getenv("DB_SSL", "").strip().lower()
+    if not raw_value:
+        return ENVIRONMENT == "production"
+    return raw_value in {"1", "true", "yes", "on", "require"}
+
+
+DB_SSL = _resolve_db_ssl()
 
 # Global connection pool
 _pool: Optional[Any] = None
@@ -31,11 +43,14 @@ async def init_db():
                 database=DB_NAME,
                 user=DB_USER,
                 password=DB_PASSWORD,
+                ssl=DB_SSL,
                 min_size=5,
                 max_size=20,
                 command_timeout=60,
             )
-            print(f"✓ DB pool initialized: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+            print(
+                f"✓ DB pool initialized: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME} (ssl={DB_SSL})"
+            )
         except Exception as e:
             print(f"✗ DB pool init failed: {e}")
             raise
