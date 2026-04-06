@@ -9,6 +9,8 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: ENVIRONMENT
         value: production
       - key: DATA_SOURCE_MODE
