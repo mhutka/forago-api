@@ -284,7 +284,7 @@ async def insert_find(
         await conn.close()
 
 
-async def get_find_by_id(find_id: str) -> Optional[dict]:
+async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
     """Fetch a single find with images and comments by ID."""
     conn = await get_db_connection()
     try:
@@ -292,9 +292,10 @@ async def get_find_by_id(find_id: str) -> Optional[dict]:
             """
             SELECT id, user_id, date, description, cluster_hash,
                    latitude, longitude, category_paths, period
-            FROM finds WHERE id = $1::uuid
+            FROM finds WHERE id = $1::uuid AND user_id = $2::uuid
             """,
             find_id,
+            user_id,
         )
         if row is None:
             return None
@@ -320,8 +321,155 @@ async def get_find_by_id(find_id: str) -> Optional[dict]:
         await conn.close()
 
 
+async def get_user_profile(user_id: str) -> Optional[dict]:
+    """Fetch profile data for a user including earned badge codes."""
+    conn = await get_db_connection()
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                p.id,
+                p.account_tier,
+                p.badge,
+                p.last_action_at,
+                p.language_code,
+                p.map_center_lat,
+                p.map_center_lng,
+                p.map_zoom,
+                p.default_category,
+                p.display_nickname,
+                p.display_name,
+                p.avatar_url,
+                p.created_at,
+                p.updated_at,
+                COALESCE(
+                    ARRAY_AGG(ub.badge_code) FILTER (WHERE ub.badge_code IS NOT NULL),
+                    ARRAY[]::text[]
+                ) AS badges
+            FROM profiles p
+            LEFT JOIN user_badges ub ON ub.user_id = p.id
+            WHERE p.id = $1::uuid
+            GROUP BY p.id
+            """,
+            user_id,
+        )
+
+        if row is None:
+            return None
+
+        return {
+            "userId": str(row["id"]),
+            "accountTier": row["account_tier"],
+            "badge": row["badge"],
+            "lastActionAt": row["last_action_at"],
+            "languageCode": row["language_code"],
+            "mapCenterLat": float(row["map_center_lat"]),
+            "mapCenterLng": float(row["map_center_lng"]),
+            "mapZoom": float(row["map_zoom"]),
+            "defaultCategory": row["default_category"],
+            "displayNickname": row["display_nickname"],
+            "displayName": row["display_name"],
+            "avatarUrl": row["avatar_url"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+            "badges": list(row["badges"] or []),
+        }
+    finally:
+        await conn.close()
+
+
+async def ensure_user_profile(
+    user_id: str,
+    fallback_nickname: str,
+    fallback_display_name: str,
+    fallback_language_code: str = "sk",
+) -> dict:
+    """Ensure user has a profile row, then return profile payload."""
+    conn = await get_db_connection()
+    try:
+        await conn.execute(
+            """
+            INSERT INTO profiles (
+                id,
+                display_nickname,
+                display_name,
+                language_code
+            )
+            VALUES ($1::uuid, $2, $3, $4)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            user_id,
+            fallback_nickname,
+            fallback_display_name,
+            fallback_language_code,
+        )
+    finally:
+        await conn.close()
+
+    profile = await get_user_profile(user_id)
+    if profile is None:
+        raise RuntimeError("Failed to load profile after ensure")
+    return profile
+
+
+async def update_user_profile(
+    user_id: str,
+    display_nickname: Optional[str] = None,
+    display_name: Optional[str] = None,
+    avatar_url: Optional[str] = None,
+    language_code: Optional[str] = None,
+    map_center_lat: Optional[float] = None,
+    map_center_lng: Optional[float] = None,
+    map_zoom: Optional[float] = None,
+    default_category: Optional[str] = None,
+) -> Optional[dict]:
+    """Update editable profile fields for the given user."""
+    conn = await get_db_connection()
+    try:
+        set_parts = []
+        params: list = []
+
+        if display_nickname is not None:
+            params.append(display_nickname)
+            set_parts.append(f"display_nickname = ${len(params)}")
+        if display_name is not None:
+            params.append(display_name)
+            set_parts.append(f"display_name = ${len(params)}")
+        if avatar_url is not None:
+            params.append(avatar_url)
+            set_parts.append(f"avatar_url = ${len(params)}")
+        if language_code is not None:
+            params.append(language_code)
+            set_parts.append(f"language_code = ${len(params)}")
+        if map_center_lat is not None:
+            params.append(map_center_lat)
+            set_parts.append(f"map_center_lat = ${len(params)}")
+        if map_center_lng is not None:
+            params.append(map_center_lng)
+            set_parts.append(f"map_center_lng = ${len(params)}")
+        if map_zoom is not None:
+            params.append(map_zoom)
+            set_parts.append(f"map_zoom = ${len(params)}")
+        if default_category is not None:
+            params.append(default_category)
+            set_parts.append(f"default_category = ${len(params)}")
+
+        if set_parts:
+            set_parts.append("updated_at = now()")
+            params.append(user_id)
+            await conn.execute(
+                f"UPDATE profiles SET {', '.join(set_parts)} WHERE id = ${len(params)}::uuid",
+                *params,
+            )
+    finally:
+        await conn.close()
+
+    return await get_user_profile(user_id)
+
+
 async def update_find(
     find_id: str,
+    user_id: str,
     date: Optional[datetime] = None,
     description: Optional[str] = None,
     latitude: Optional[float] = None,
@@ -355,14 +503,16 @@ async def update_find(
             set_parts.append(f"period = ${len(params)}")
 
         if not set_parts:
-            return await get_find_by_id(find_id)
+            return await get_find_by_id(find_id, user_id)
 
         set_parts.append("updated_at = now()")
         params.append(find_id)
+        params.append(user_id)
 
         query = f"""
             UPDATE finds SET {', '.join(set_parts)}
-            WHERE id = ${len(params)}::uuid
+                        WHERE id = ${len(params) - 1}::uuid
+                            AND user_id = ${len(params)}::uuid
             RETURNING id, user_id, date, description, cluster_hash,
                       latitude, longitude, category_paths, period
         """
@@ -392,12 +542,12 @@ async def update_find(
         await conn.close()
 
 
-async def delete_find(find_id: str) -> bool:
+async def delete_find(find_id: str, user_id: str) -> bool:
     """Delete a find by ID. Returns True if a row was deleted."""
     conn = await get_db_connection()
     try:
         result = await conn.execute(
-            "DELETE FROM finds WHERE id = $1::uuid", find_id
+            "DELETE FROM finds WHERE id = $1::uuid AND user_id = $2::uuid", find_id, user_id
         )
         return result == "DELETE 1"
     finally:

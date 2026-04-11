@@ -24,6 +24,9 @@ from queries import (
     update_find as db_update_find,
     delete_find as db_delete_find,
     query_clusters,
+    ensure_user_profile,
+    get_user_profile,
+    update_user_profile,
 )
 
 load_dotenv()
@@ -118,6 +121,67 @@ class AuthMeResponse(BaseModel):
     issuer: Optional[str] = None
     audience: Optional[str] = None
 
+
+class UserProfileResponse(BaseModel):
+    userId: str
+    accountTier: str
+    badge: Optional[str] = None
+    lastActionAt: Optional[datetime] = None
+    languageCode: str
+    mapCenterLat: float
+    mapCenterLng: float
+    mapZoom: float
+    defaultCategory: str
+    displayNickname: str
+    displayName: Optional[str] = None
+    avatarUrl: Optional[str] = None
+    createdAt: datetime
+    updatedAt: datetime
+    badges: List[str] = []
+
+
+class UpdateUserProfileRequest(BaseModel):
+    displayNickname: Optional[str] = None
+    displayName: Optional[str] = None
+    avatarUrl: Optional[str] = None
+    languageCode: Optional[str] = None
+    mapCenterLat: Optional[float] = None
+    mapCenterLng: Optional[float] = None
+    mapZoom: Optional[float] = None
+    defaultCategory: Optional[str] = None
+
+    @field_validator("displayNickname")
+    @classmethod
+    def validate_display_nickname(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        value = v.strip()
+        if len(value) < 3:
+            raise ValueError("displayNickname must be at least 3 characters")
+        if len(value) > 40:
+            raise ValueError("displayNickname must be at most 40 characters")
+        return value
+
+    @field_validator("languageCode")
+    @classmethod
+    def validate_language_code(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        value = v.strip().lower()
+        allowed = {"sk", "cs", "en", "de", "pl", "hu"}
+        if value not in allowed:
+            raise ValueError(f"languageCode must be one of {sorted(allowed)}")
+        return value
+
+    @field_validator("mapZoom")
+    @classmethod
+    def validate_map_zoom(cls, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return v
+        if v < 1 or v > 22:
+            raise ValueError("mapZoom must be between 1 and 22")
+        return v
+
 VALID_PERIODS = {
     "JAN_1", "JAN_2", "FEB_1", "FEB_2", "MAR_1", "MAR_2",
     "APR_1", "APR_2", "MAY_1", "MAY_2", "JUN_1", "JUN_2",
@@ -176,6 +240,43 @@ MOCK_FINDS = {
         clusterHash="48.71_19.15",
     ),
 }
+
+MOCK_PROFILES = {
+    "user_jan": {
+        "userId": "user_jan",
+        "accountTier": "free",
+        "badge": None,
+        "lastActionAt": datetime.now(),
+        "languageCode": "sk",
+        "mapCenterLat": 48.1486,
+        "mapCenterLng": 17.1077,
+        "mapZoom": 11.0,
+        "defaultCategory": "nature/forest",
+        "displayNickname": "jan",
+        "displayName": "Jan",
+        "avatarUrl": None,
+        "createdAt": datetime.now(),
+        "updatedAt": datetime.now(),
+        "badges": [],
+    }
+}
+
+
+def _derive_fallback_nickname(user_id: str, email: Optional[str]) -> str:
+    if email:
+        candidate = email.split("@", 1)[0].strip().lower()
+        candidate = "".join(ch for ch in candidate if ch.isalnum() or ch in {"_", "-"})
+        if len(candidate) >= 3:
+            return candidate[:40]
+    return f"user_{user_id.replace('-', '')[:8]}"
+
+
+def _derive_fallback_display_name(email: Optional[str], nickname: str) -> str:
+    if email:
+        local = email.split("@", 1)[0].strip()
+        if local:
+            return local[:80]
+    return nickname
 
 
 def _public_records_from_mock() -> List[PublicFindRecord]:
@@ -248,6 +349,107 @@ async def auth_me(current_user: AuthUser = Depends(get_current_user)):
         issuer=issuer,
         audience=audience,
     )
+
+
+@app.get("/api/profile", response_model=UserProfileResponse)
+async def get_profile(current_user: AuthUser = Depends(get_current_user)):
+    """Return authenticated user's editable profile and preferences."""
+    try:
+        if DATA_SOURCE_MODE == "db":
+            claims = current_user.claims
+            email_claim = claims.get("email")
+            email = email_claim if isinstance(email_claim, str) else None
+
+            nickname = _derive_fallback_nickname(current_user.user_id, email)
+            display_name = _derive_fallback_display_name(email, nickname)
+
+            profile = await get_user_profile(current_user.user_id)
+            if profile is None:
+                profile = await ensure_user_profile(
+                    user_id=current_user.user_id,
+                    fallback_nickname=nickname,
+                    fallback_display_name=display_name,
+                )
+            return UserProfileResponse(**profile)
+
+        if current_user.user_id not in MOCK_PROFILES:
+            claims = current_user.claims
+            email_claim = claims.get("email")
+            email = email_claim if isinstance(email_claim, str) else None
+            nickname = _derive_fallback_nickname(current_user.user_id, email)
+            MOCK_PROFILES[current_user.user_id] = {
+                "userId": current_user.user_id,
+                "accountTier": "free",
+                "badge": None,
+                "lastActionAt": datetime.now(),
+                "languageCode": "sk",
+                "mapCenterLat": 48.1486,
+                "mapCenterLng": 17.1077,
+                "mapZoom": 11.0,
+                "defaultCategory": "nature/forest",
+                "displayNickname": nickname,
+                "displayName": _derive_fallback_display_name(email, nickname),
+                "avatarUrl": None,
+                "createdAt": datetime.now(),
+                "updatedAt": datetime.now(),
+                "badges": [],
+            }
+        return UserProfileResponse(**MOCK_PROFILES[current_user.user_id])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load profile: {str(e)}")
+
+
+@app.patch("/api/profile", response_model=UserProfileResponse)
+async def patch_profile(
+    request: UpdateUserProfileRequest,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Update authenticated user's profile preferences."""
+    try:
+        if DATA_SOURCE_MODE == "db":
+            updated = await update_user_profile(
+                user_id=current_user.user_id,
+                display_nickname=request.displayNickname,
+                display_name=request.displayName,
+                avatar_url=request.avatarUrl,
+                language_code=request.languageCode,
+                map_center_lat=request.mapCenterLat,
+                map_center_lng=request.mapCenterLng,
+                map_zoom=request.mapZoom,
+                default_category=request.defaultCategory,
+            )
+            if updated is None:
+                raise HTTPException(status_code=404, detail="Profile not found")
+            return UserProfileResponse(**updated)
+
+        if current_user.user_id not in MOCK_PROFILES:
+            _ = await get_profile(current_user)
+
+        profile = MOCK_PROFILES[current_user.user_id]
+        updates = {
+            "displayNickname": request.displayNickname,
+            "displayName": request.displayName,
+            "avatarUrl": request.avatarUrl,
+            "languageCode": request.languageCode,
+            "mapCenterLat": request.mapCenterLat,
+            "mapCenterLng": request.mapCenterLng,
+            "mapZoom": request.mapZoom,
+            "defaultCategory": request.defaultCategory,
+        }
+        for key, value in updates.items():
+            if value is not None:
+                profile[key] = value
+        profile["updatedAt"] = datetime.now()
+        return UserProfileResponse(**profile)
+    except HTTPException:
+        raise
+    except Exception as e:
+        detail = str(e)
+        if "ux_profiles_display_nickname_lower" in detail or "duplicate key" in detail.lower():
+            raise HTTPException(status_code=409, detail="Display nickname is already in use")
+        raise HTTPException(status_code=500, detail=f"Failed to update profile: {detail}")
 
 @app.get("/api/health")
 async def health_check():

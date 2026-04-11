@@ -81,3 +81,63 @@ def test_create_and_list_private_finds_with_valid_jwt():
     assert list_response.status_code == 200
     ids = [item["id"] for item in list_response.json()]
     assert created_id in ids
+
+
+def test_profile_endpoint_requires_authentication():
+    response = client.get("/api/profile")
+    assert response.status_code == 401
+
+
+def test_get_profile_creates_default_profile_for_user():
+    user_id = "00000000-0000-0000-0000-000000000333"
+    response = client.get("/api/profile", headers=auth_headers(user_id))
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["userId"] == user_id
+    assert payload["accountTier"] == "free"
+    assert payload["languageCode"] == "sk"
+    assert payload["mapZoom"] == 11.0
+    assert "displayNickname" in payload
+    assert "badges" in payload
+
+
+def test_update_profile_persists_changes():
+    user_id = "00000000-0000-0000-0000-000000000444"
+    
+    initial = client.get("/api/profile", headers=auth_headers(user_id))
+    assert initial.status_code == 200
+
+    update_response = client.patch(
+        "/api/profile",
+        headers=auth_headers(user_id),
+        json={
+            "displayNickname": "updated_nick",
+            "displayName": "Updated Display Name",
+            "languageCode": "en",
+            "mapZoom": 12.5,
+        },
+    )
+
+    assert update_response.status_code == 200
+    updated = update_response.json()
+    assert updated["displayNickname"] == "updated_nick"
+    assert updated["displayName"] == "Updated Display Name"
+    assert updated["languageCode"] == "en"
+    assert updated["mapZoom"] == 12.5
+
+
+def test_update_profile_rejects_invalid_zoom():
+    user_id = "00000000-0000-0000-0000-000000000555"
+    _ = client.get("/api/profile", headers=auth_headers(user_id))
+
+    response = client.patch(
+        "/api/profile",
+        headers=auth_headers(user_id),
+        json={
+            "displayNickname": "nick",
+            "mapZoom": 25.0,
+        },
+    )
+
+    assert response.status_code == 422
