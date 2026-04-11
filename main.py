@@ -15,6 +15,7 @@ import asyncio
 
 from database import init_db, close_db, run_migrations
 from auth import AuthUser, get_current_user, validate_auth_configuration
+from version import __version__
 from queries import (
     query_public_finds,
     query_private_finds,
@@ -457,7 +458,17 @@ async def health_check():
     return {
         "status": "ok",
         "timestamp": datetime.utcnow(),
-        "version": "1.0.0",
+        "version": __version__,
+        "dataSourceMode": DATA_SOURCE_MODE,
+    }
+
+
+@app.get("/api/version")
+async def version_info():
+    """Return backend version for debugging/monitoring"""
+    return {
+        "backend": __version__,
+        "environment": ENVIRONMENT,
         "dataSourceMode": DATA_SOURCE_MODE,
     }
 
