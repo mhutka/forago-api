@@ -3,6 +3,7 @@ Database connection and utilities for ForaGo Backend
 """
 
 import os
+import ssl
 from typing import Optional, Any
 from dotenv import load_dotenv
 
@@ -17,15 +18,45 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
 
 
-def _resolve_db_ssl() -> bool:
-    """Resolve DB SSL mode from env, defaulting to enabled in production."""
+def _resolve_db_ssl_mode() -> str:
+    """Resolve DB SSL mode from env.
+
+    Supported modes:
+    - disable: no TLS
+    - require: TLS without certificate verification
+    - verify-full: TLS with certificate verification
+    """
+    mode = os.getenv("DB_SSL_MODE", "").strip().lower()
+    if mode:
+        if mode in {"disable", "require", "verify-full"}:
+            return mode
+        raise RuntimeError("DB_SSL_MODE must be one of: disable, require, verify-full")
+
+    # Backward compatibility with DB_SSL boolean env.
     raw_value = os.getenv("DB_SSL", "").strip().lower()
-    if not raw_value:
-        return ENVIRONMENT == "production"
-    return raw_value in {"1", "true", "yes", "on", "require"}
+    if raw_value:
+        enabled = raw_value in {"1", "true", "yes", "on", "require"}
+        return "require" if enabled else "disable"
+
+    return "require" if ENVIRONMENT == "production" else "disable"
 
 
-DB_SSL = _resolve_db_ssl()
+def _resolve_db_ssl_context() -> Any:
+    mode = _resolve_db_ssl_mode()
+    if mode == "disable":
+        return False
+
+    if mode == "require":
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+
+    return ssl.create_default_context()
+
+
+DB_SSL_MODE = _resolve_db_ssl_mode()
+DB_SSL = _resolve_db_ssl_context()
 
 # Global connection pool
 _pool: Optional[Any] = None
@@ -49,7 +80,7 @@ async def init_db():
                 command_timeout=60,
             )
             print(
-                f"✓ DB pool initialized: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME} (ssl={DB_SSL})"
+                f"✓ DB pool initialized: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME} (ssl_mode={DB_SSL_MODE})"
             )
         except Exception as e:
             print(f"✗ DB pool init failed: {e}")
