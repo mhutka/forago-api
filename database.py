@@ -16,6 +16,7 @@ DB_NAME = os.getenv("DB_NAME", "forago")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
+DB_STATEMENT_CACHE_SIZE = int(os.getenv("DB_STATEMENT_CACHE_SIZE", "0"))
 
 
 def _resolve_db_ssl_mode() -> str:
@@ -75,12 +76,14 @@ async def init_db():
                 user=DB_USER,
                 password=DB_PASSWORD,
                 ssl=DB_SSL,
+                statement_cache_size=DB_STATEMENT_CACHE_SIZE,
                 min_size=5,
                 max_size=20,
                 command_timeout=60,
             )
             print(
-                f"✓ DB pool initialized: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME} (ssl_mode={DB_SSL_MODE})"
+                f"✓ DB pool initialized: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME} "
+                f"(ssl_mode={DB_SSL_MODE}, statement_cache_size={DB_STATEMENT_CACHE_SIZE})"
             )
         except Exception as e:
             print(f"✗ DB pool init failed: {e}")
