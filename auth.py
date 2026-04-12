@@ -75,9 +75,10 @@ def _jwt_algorithms() -> List[str]:
     if configured and configured.strip():
         return _parse_algorithms(configured)
 
-    # Supabase access tokens are RS256 by default.
+    # Supabase access tokens are typically RS256, but can also be ES256
+    # depending on project signing key configuration.
     if os.getenv("SUPABASE_URL", "").strip():
-        return ["RS256"]
+        return ["RS256", "ES256"]
 
     return ["HS256"]
 

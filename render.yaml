@@ -40,7 +40,7 @@ services:
       - key: SUPABASE_JWT_AUDIENCE
         value: authenticated
       - key: JWT_ALGORITHMS
-        value: RS256
+        value: RS256,ES256
       - key: JWT_ISSUER
         sync: false
       - key: JWT_JWKS_URL
