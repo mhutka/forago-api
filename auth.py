@@ -25,7 +25,7 @@ class AuthUser:
 
 
 def _parse_algorithms(raw: str) -> List[str]:
-    algorithms = [item.strip() for item in raw.split(",") if item.strip()]
+    algorithms = [item.strip().upper() for item in raw.split(",") if item.strip()]
     return algorithms or ["HS256"]
 
 
@@ -71,7 +71,15 @@ def _jwt_audience() -> Optional[str]:
 
 
 def _jwt_algorithms() -> List[str]:
-    return _parse_algorithms(os.getenv("JWT_ALGORITHMS", os.getenv("JWT_ALGORITHM", "HS256")))
+    configured = os.getenv("JWT_ALGORITHMS") or os.getenv("JWT_ALGORITHM")
+    if configured and configured.strip():
+        return _parse_algorithms(configured)
+
+    # Supabase access tokens are RS256 by default.
+    if os.getenv("SUPABASE_URL", "").strip():
+        return ["RS256"]
+
+    return ["HS256"]
 
 
 def _jwt_jwks_url() -> str:
@@ -117,11 +125,16 @@ def _pick_jwk_for_token(token: str, algorithms: List[str]) -> Dict[str, Any]:
     header = jwt.get_unverified_header(token)
     token_kid = header.get("kid")
     token_alg = header.get("alg")
+    if isinstance(token_alg, str):
+        token_alg = token_alg.upper()
 
     if token_alg and token_alg not in algorithms:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unsupported token algorithm",
+            detail=(
+                f"Unsupported token algorithm '{token_alg}'. "
+                f"Configured algorithms: {', '.join(algorithms)}"
+            ),
             headers={"WWW-Authenticate": "Bearer"},
         )
 
