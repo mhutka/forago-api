@@ -93,12 +93,14 @@ class RecordImageRef(BaseModel):
 class RecordComment(BaseModel):
     id: str
     userId: str
+    displayNickname: Optional[str] = None
     text: str
     createdAt: datetime
 
 class PublicFindRecord(BaseModel):
     id: str
     userId: str
+    displayNickname: Optional[str] = None
     date: datetime
     categoryPaths: List[List[str]]
     description: str

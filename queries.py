@@ -34,6 +34,8 @@ async def _fetch_images_and_comments(conn, find_uuids: list):
         "FROM find_comments WHERE find_id = ANY($1::uuid[]) ORDER BY created_at ASC",
         find_uuids,
     )
+    comment_user_ids = [row["user_id"] for row in cmt_rows]
+    comment_nicknames = await _fetch_display_nicknames(conn, comment_user_ids)
 
     images_by_id: dict = {}
     for r in img_rows:
@@ -50,11 +52,24 @@ async def _fetch_images_and_comments(conn, find_uuids: list):
         comments_by_id.setdefault(fid, []).append({
             "id": str(r["id"]),
             "userId": str(r["user_id"]),
+            "displayNickname": comment_nicknames.get(str(r["user_id"])),
             "text": r["text"],
             "createdAt": r["created_at"],
         })
 
     return images_by_id, comments_by_id
+
+
+async def _fetch_display_nicknames(conn, user_ids: list) -> dict:
+    """Fetch display nicknames for a set of user UUIDs."""
+    if not user_ids:
+        return {}
+
+    rows = await conn.fetch(
+        "SELECT id, display_nickname FROM profiles WHERE id = ANY($1::uuid[])",
+        user_ids,
+    )
+    return {str(row["id"]): row["display_nickname"] for row in rows}
 
 
 async def query_public_finds(
@@ -108,7 +123,9 @@ async def query_public_finds(
         rows = await conn.fetch(query, *params)
 
         find_uuids = [row["id"] for row in rows]
+        owner_ids = [row["user_id"] for row in rows]
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
+        nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
 
         results = []
         for row in rows:
@@ -116,6 +133,7 @@ async def query_public_finds(
             results.append({
                 "id": fid,
                 "userId": str(row["user_id"]),
+                "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
                 "date": row["date"],
                 "description": row["description"],
                 "clusterHash": row["cluster_hash"],
@@ -180,7 +198,9 @@ async def query_private_finds(
         rows = await conn.fetch(query, *params)
 
         find_uuids = [row["id"] for row in rows]
+        owner_ids = [row["user_id"] for row in rows]
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
+        nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
 
         results = []
         for row in rows:
@@ -188,6 +208,7 @@ async def query_private_finds(
             results.append({
                 "id": fid,
                 "userId": str(row["user_id"]),
+                "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
                 "date": row["date"],
                 "description": row["description"],
                 "clusterHash": row["cluster_hash"],
@@ -265,9 +286,11 @@ async def insert_find(
 
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
+        nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
         return {
             "id": fid,
             "userId": str(row["user_id"]),
+            "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
             "date": row["date"],
             "description": row["description"],
             "clusterHash": row["cluster_hash"],
@@ -302,9 +325,11 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
 
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
+        nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
         return {
             "id": fid,
             "userId": str(row["user_id"]),
+            "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
             "date": row["date"],
             "description": row["description"],
             "clusterHash": row["cluster_hash"],
@@ -523,9 +548,11 @@ async def update_find(
 
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
+        nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
         return {
             "id": fid,
             "userId": str(row["user_id"]),
+            "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
             "date": row["date"],
             "description": row["description"],
             "clusterHash": row["cluster_hash"],
