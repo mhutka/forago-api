@@ -15,12 +15,14 @@ import asyncio
 
 from database import init_db, close_db, run_migrations
 from auth import AuthUser, get_current_user, validate_auth_configuration
+from r2_storage import generate_find_image_upload_plans, is_r2_configured
 from version import __version__
 from queries import (
     query_public_finds,
     query_private_finds,
     query_finds_nearby,
     insert_find,
+    insert_find_images,
     get_find_by_id,
     update_find as db_update_find,
     delete_find as db_delete_find,
@@ -222,6 +224,27 @@ class UpdateFindRequest(BaseModel):
         if v is not None and v not in VALID_PERIODS:
             raise ValueError(f'Invalid period "{v}". Valid values: {sorted(VALID_PERIODS)}')
         return v
+
+
+class PresignFindImagesRequest(BaseModel):
+    imageIds: List[str]
+
+
+class PresignedFindImageUpload(BaseModel):
+    imageId: str
+    storageRef: str
+    thumbnailUploadUrl: str
+    fullUploadUrl: str
+    thumbnailUrl: str
+    fullUrl: str
+
+
+class PresignFindImagesResponse(BaseModel):
+    uploads: List[PresignedFindImageUpload]
+
+
+class AttachFindImagesRequest(BaseModel):
+    images: List[RecordImageRef]
 
 # ============ MOCK DATA (temporary) ============
 MOCK_FINDS = {
@@ -679,6 +702,73 @@ async def get_find(find_id: str, current_user: AuthUser = Depends(get_current_us
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
+
+
+@app.post("/api/finds/{find_id}/images/presign", response_model=PresignFindImagesResponse)
+async def presign_find_images(
+    find_id: str,
+    request: PresignFindImagesRequest,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Create presigned R2 upload URLs for a user's find images."""
+    if not request.imageIds:
+        raise HTTPException(status_code=400, detail="At least one imageId is required")
+
+    if len(request.imageIds) > 10:
+        raise HTTPException(status_code=400, detail="Too many images requested")
+
+    try:
+        if DATA_SOURCE_MODE != "db":
+            raise HTTPException(status_code=501, detail="Image uploads are only available in db mode")
+
+        existing = await get_find_by_id(find_id, current_user.user_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Find not found")
+
+        if not is_r2_configured():
+            raise HTTPException(status_code=503, detail="R2 storage is not configured")
+
+        uploads = generate_find_image_upload_plans(
+            user_id=current_user.user_id,
+            find_id=find_id,
+            image_ids=request.imageIds,
+        )
+        return PresignFindImagesResponse(
+            uploads=[PresignedFindImageUpload(**item) for item in uploads]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create upload URLs: {str(e)}")
+
+
+@app.post("/api/finds/{find_id}/images", response_model=List[RecordImageRef], status_code=status.HTTP_201_CREATED)
+async def attach_find_images(
+    find_id: str,
+    request: AttachFindImagesRequest,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Persist uploaded image metadata for an existing find."""
+    if not request.images:
+        raise HTTPException(status_code=400, detail="At least one image reference is required")
+
+    try:
+        if DATA_SOURCE_MODE != "db":
+            raise HTTPException(status_code=501, detail="Image uploads are only available in db mode")
+
+        existing = await get_find_by_id(find_id, current_user.user_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Find not found")
+
+        saved = await insert_find_images(
+            find_id,
+            [image.model_dump() for image in request.images],
+        )
+        return [RecordImageRef(**item) for item in saved]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save image metadata: {str(e)}")
 
 @app.put("/api/finds/{find_id}", response_model=PrivateFindRecord)
 async def update_find(

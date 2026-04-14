@@ -492,6 +492,30 @@ async def update_user_profile(
     return await get_user_profile(user_id)
 
 
+async def insert_find_images(find_id: str, images: List[dict]) -> List[dict]:
+    """Persist uploaded image metadata for a find."""
+    if not images:
+        return []
+
+    conn = await get_db_connection()
+    try:
+        async with conn.transaction():
+            for image in images:
+                await conn.execute(
+                    """
+                    INSERT INTO find_images (find_id, thumbnail_url, full_url, storage_ref)
+                    VALUES ($1::uuid, $2, $3, $4)
+                    """,
+                    find_id,
+                    image["thumbnailUrl"],
+                    image["fullUrl"],
+                    image.get("storageRef"),
+                )
+        return images
+    finally:
+        await conn.close()
+
+
 async def update_find(
     find_id: str,
     user_id: str,
