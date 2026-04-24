@@ -3,6 +3,7 @@ ForaGo Backend - FastAPI + PostgreSQL
 Main application file with routes
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -11,7 +12,6 @@ from typing import List, Optional
 from pydantic import BaseModel, field_validator
 import os
 from dotenv import load_dotenv
-import asyncio
 
 from database import init_db, close_db, run_migrations
 from auth import AuthUser, get_current_user, validate_auth_configuration
@@ -66,10 +66,40 @@ def _validate_startup_configuration() -> None:
     validate_auth_configuration(is_production=_is_production_env())
 
 # ============ CONFIG ============
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize and cleanup application resources."""
+    _validate_startup_configuration()
+
+    print("🚀 ForaGo API started")
+    print("📖 Docs: http://localhost:8000/docs")
+    print("🔧 ReDoc: http://localhost:8000/redoc")
+    print(f"🗂️ Data source mode: {DATA_SOURCE_MODE}")
+
+    if DATA_SOURCE_MODE == "db":
+        try:
+            await init_db()
+            await run_migrations()
+            print("✓ Database initialized and migrations applied")
+        except Exception as e:
+            print(f"✗ Database initialization failed: {e}")
+            raise
+
+    try:
+        yield
+    finally:
+        if DATA_SOURCE_MODE == "db":
+            try:
+                await close_db()
+            except Exception as e:
+                print(f"✗ Database shutdown error: {e}")
+
+
 app = FastAPI(
     title="ForaGo API",
     version="1.0.0",
-    description="Backend for ForaGo bushcraft app"
+    description="Backend for ForaGo bushcraft app",
+    lifespan=lifespan,
 )
 
 # CORS settings - allow Flutter (localhost:port) and web (Cloudflare Pages)
@@ -885,38 +915,6 @@ async def http_exception_handler(request, exc):
             "timestamp": datetime.utcnow().isoformat(),
         },
     )
-
-# ============ STARTUP / SHUTDOWN ============
-
-@app.on_event("startup")
-async def startup():
-    """Initialize on startup"""
-    _validate_startup_configuration()
-
-    print("🚀 ForaGo API started")
-    print(f"📖 Docs: http://localhost:8000/docs")
-    print(f"🔧 ReDoc: http://localhost:8000/redoc")
-    print(f"🗂️ Data source mode: {DATA_SOURCE_MODE}")
-    
-    if DATA_SOURCE_MODE == "db":
-        try:
-            await init_db()
-            await run_migrations()
-            print("✓ Database initialized and migrations applied")
-        except Exception as e:
-            print(f"✗ Database initialization failed: {e}")
-            raise
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    """Cleanup on shutdown"""
-    if DATA_SOURCE_MODE == "db":
-        try:
-            await close_db()
-        except Exception as e:
-            print(f"✗ Database shutdown error: {e}")
-
 
 if __name__ == "__main__":
     import uvicorn
