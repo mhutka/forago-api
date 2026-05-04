@@ -1,18 +1,21 @@
 """
 ForaGo Backend - FastAPI + PostgreSQL
-Main application file with routes
+Main application file with routes and configuration.
 """
 
+import logging
+import logging.handlers
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from typing import Dict, List, Optional
 from datetime import datetime
-from typing import List, Optional
-from pydantic import BaseModel, field_validator
-import os
-from dotenv import load_dotenv
 
+from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+from config import settings
 from database import init_db, close_db, run_migrations
 from auth import AuthUser, get_current_user, validate_auth_configuration
 from r2_storage import generate_find_image_upload_plans, is_r2_configured
@@ -32,85 +35,70 @@ from queries import (
     update_user_profile,
 )
 
-load_dotenv()
-
-DATA_SOURCE_MODE = os.getenv("DATA_SOURCE_MODE", "mock").lower()
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
-
-
-def _parse_cors_origins() -> List[str]:
-    raw = os.getenv("CORS_ORIGINS", "").strip()
-    if not raw:
-        return [
-            "http://localhost",
-            "http://127.0.0.1",
-            "https://forago.app",
-        ]
-
-    origins = [item.strip() for item in raw.split(",") if item.strip()]
-    return origins or [
-        "http://localhost",
-        "http://127.0.0.1",
-        "https://forago.app",
-    ]
-
-
-def _is_production_env() -> bool:
-    return ENVIRONMENT in {"production", "prod"}
-
-
-def _validate_startup_configuration() -> None:
-    if _is_production_env() and DATA_SOURCE_MODE != "db":
-        raise RuntimeError("Production requires DATA_SOURCE_MODE=db")
-
-    validate_auth_configuration(is_production=_is_production_env())
+# ============ LOGGING SETUP ============
+logging.basicConfig(
+    level=getattr(logging, settings.log_level),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # ============ CONFIG ============
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup application resources."""
-    _validate_startup_configuration()
+    logger.info("🚀 ForaGo API starting up")
+    logger.info("📖 Docs: http://localhost:8000/docs")
+    logger.info("🔧 ReDoc: http://localhost:8000/redoc")
+    logger.info("🗂️ Data source mode: %s", settings.data_source_mode)
 
-    print("🚀 ForaGo API started")
-    print("📖 Docs: http://localhost:8000/docs")
-    print("🔧 ReDoc: http://localhost:8000/redoc")
-    print(f"🗂️ Data source mode: {DATA_SOURCE_MODE}")
+    try:
+        settings.validate_startup()
+        validate_auth_configuration(is_production=settings.is_production())
+    except Exception as e:
+        logger.error("Startup validation failed: %s", e, exc_info=True)
+        raise
 
-    if DATA_SOURCE_MODE == "db":
+    if settings.data_source_mode == "db":
         try:
             await init_db()
             await run_migrations()
-            print("✓ Database initialized and migrations applied")
+            logger.info("✓ Database initialized and migrations applied")
         except Exception as e:
-            print(f"✗ Database initialization failed: {e}")
+            logger.error("Database initialization failed: %s", e, exc_info=True)
             raise
 
     try:
         yield
     finally:
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             try:
                 await close_db()
+                logger.info("✓ Database pool closed")
             except Exception as e:
-                print(f"✗ Database shutdown error: {e}")
+                logger.error("Database shutdown error: %s", e, exc_info=True)
 
 
 app = FastAPI(
     title="ForaGo API",
-    version="1.0.0",
+    version=__version__,
     description="Backend for ForaGo bushcraft app",
     lifespan=lifespan,
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
 )
 
-# CORS settings - allow Flutter (localhost:port) and web (Cloudflare Pages)
+# Middleware: CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_parse_cors_origins(),
+    allow_origins=settings.get_parsed_cors_origins(),
     allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)*forago\.pages\.dev$|^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Middleware: Compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ============ SCHEMAS (Pydantic) ============
 class LatLng(BaseModel):
@@ -138,15 +126,15 @@ class PublicFindRecord(BaseModel):
     description: str
     clusterHash: str
     period: Optional[str] = None
-    images: List[RecordImageRef] = []
-    comments: List[RecordComment] = []
+    images: List[RecordImageRef] = Field(default_factory=list)
+    comments: List[RecordComment] = Field(default_factory=list)
 
 class PrivateFindRecord(PublicFindRecord):
     location: LatLng
 
 class PublicClusterRecord(BaseModel):
     clusterHash: str
-    categoryPathCounts: dict
+    categoryPathCounts: Dict[str, int]
     totalRecords: int
     lastUpdated: datetime
 
@@ -172,7 +160,7 @@ class UserProfileResponse(BaseModel):
     avatarUrl: Optional[str] = None
     createdAt: datetime
     updatedAt: datetime
-    badges: List[str] = []
+    badges: List[str] = Field(default_factory=list)
 
 
 class UpdateUserProfileRequest(BaseModel):
@@ -319,6 +307,7 @@ MOCK_PROFILES = {
 
 
 def _derive_fallback_nickname(user_id: str, email: Optional[str]) -> str:
+    """Derive a fallback display nickname from user_id or email."""
     if email:
         candidate = email.split("@", 1)[0].strip().lower()
         candidate = "".join(ch for ch in candidate if ch.isalnum() or ch in {"_", "-"})
@@ -328,6 +317,7 @@ def _derive_fallback_nickname(user_id: str, email: Optional[str]) -> str:
 
 
 def _derive_fallback_display_name(email: Optional[str], nickname: str) -> str:
+    """Derive a fallback display name from email or nickname."""
     if email:
         local = email.split("@", 1)[0].strip()
         if local:
@@ -335,7 +325,8 @@ def _derive_fallback_display_name(email: Optional[str], nickname: str) -> str:
     return nickname
 
 
-def _public_records_from_mock() -> List[PublicFindRecord]:
+def _public_records_from_mock() -> List["PublicFindRecord"]:
+    """Get all public finds from mock data."""
     return [
         find
         for find in MOCK_FINDS.values()
@@ -344,7 +335,8 @@ def _public_records_from_mock() -> List[PublicFindRecord]:
     ]
 
 
-def _private_records_from_mock() -> List[PrivateFindRecord]:
+def _private_records_from_mock() -> List["PrivateFindRecord"]:
+    """Get all private finds from mock data for current user."""
     return [
         find for find in MOCK_FINDS.values() if isinstance(find, PrivateFindRecord)
     ]
@@ -411,7 +403,7 @@ async def auth_me(current_user: AuthUser = Depends(get_current_user)):
 async def get_profile(current_user: AuthUser = Depends(get_current_user)):
     """Return authenticated user's editable profile and preferences."""
     try:
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             claims = current_user.claims
             email_claim = claims.get("email")
             email = email_claim if isinstance(email_claim, str) else None
@@ -464,7 +456,7 @@ async def patch_profile(
 ):
     """Update authenticated user's profile preferences."""
     try:
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             updated = await update_user_profile(
                 user_id=current_user.user_id,
                 display_nickname=request.displayNickname,
@@ -514,7 +506,7 @@ async def health_check():
         "status": "ok",
         "timestamp": datetime.utcnow(),
         "version": __version__,
-        "dataSourceMode": DATA_SOURCE_MODE,
+        "dataSourceMode": settings.data_source_mode,
     }
 
 
@@ -523,8 +515,8 @@ async def version_info():
     """Return backend version for debugging/monitoring"""
     return {
         "backend": __version__,
-        "environment": ENVIRONMENT,
-        "dataSourceMode": DATA_SOURCE_MODE,
+        "environment": settings.environment,
+        "dataSourceMode": settings.data_source_mode,
     }
 
 # ---------- FINDS ENDPOINTS ----------
@@ -542,7 +534,7 @@ async def get_public_finds(
     Filter by cluster, category, date range, period
     """
     try:
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             results_data = await query_public_finds(
                 cluster=cluster,
                 category=category,
@@ -584,7 +576,7 @@ async def get_finds_nearby(
 ):
     """Get finds near a specific cluster"""
     try:
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             results_data = await query_finds_nearby(
                 cluster=cluster,
                 category=category,
@@ -633,7 +625,7 @@ async def get_private_finds(
     try:
         effective_user_id = current_user.user_id
 
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             results_data = await query_private_finds(
                 user_id=effective_user_id,
                 cluster=cluster,
@@ -680,7 +672,7 @@ async def create_find(
     try:
         effective_user_id = current_user.user_id
 
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             result_data = await insert_find(
                 user_id=effective_user_id,
                 date=request.date,
@@ -716,7 +708,7 @@ async def create_find(
 async def get_find(find_id: str, current_user: AuthUser = Depends(get_current_user)):
     """Get find by ID (if user has access)"""
     try:
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             result = await get_find_by_id(find_id, current_user.user_id)
             if result is None:
                 raise HTTPException(status_code=404, detail="Find not found")
@@ -748,7 +740,7 @@ async def presign_find_images(
         raise HTTPException(status_code=400, detail="Too many images requested")
 
     try:
-        if DATA_SOURCE_MODE != "db":
+        if settings.data_source_mode != "db":
             raise HTTPException(status_code=501, detail="Image uploads are only available in db mode")
 
         existing = await get_find_by_id(find_id, current_user.user_id)
@@ -783,7 +775,7 @@ async def attach_find_images(
         raise HTTPException(status_code=400, detail="At least one image reference is required")
 
     try:
-        if DATA_SOURCE_MODE != "db":
+        if settings.data_source_mode != "db":
             raise HTTPException(status_code=501, detail="Image uploads are only available in db mode")
 
         existing = await get_find_by_id(find_id, current_user.user_id)
@@ -808,7 +800,7 @@ async def update_find(
 ):
     """Update find"""
     try:
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             result = await db_update_find(
                 find_id=find_id,
                 user_id=current_user.user_id,
@@ -851,7 +843,7 @@ async def delete_find(find_id: str, current_user: AuthUser = Depends(get_current
     Requires authentication and ownership.
     """
     try:
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             deleted = await db_delete_find(find_id, current_user.user_id)
             if not deleted:
                 raise HTTPException(status_code=404, detail="Find not found")
@@ -879,7 +871,7 @@ async def get_clusters(
     Returns cluster stats without revealing exact locations
     """
     try:
-        if DATA_SOURCE_MODE == "db":
+        if settings.data_source_mode == "db":
             results_data = await query_clusters(
                 category=category,
                 from_date=from_date,
@@ -905,7 +897,7 @@ async def get_clusters(
 # ============ ERROR HANDLERS ============
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
+async def http_exception_handler(request: Request, exc: HTTPException):
     """Custom error response"""
     return JSONResponse(
         status_code=exc.status_code,

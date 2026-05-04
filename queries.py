@@ -1,15 +1,12 @@
-"""
-Database query helpers for ForaGo Backend
-"""
+"""Database query helpers for ForaGo Backend."""
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 import json
-from database import get_db_connection
-from pydantic import BaseModel
+from database import get_db_connection, release_db_connection
 
 
-def _decode_jsonb(value):
+def _decode_jsonb(value: Any) -> List[Any]:
     """asyncpg may return JSONB columns as a raw JSON string; decode if needed."""
     if isinstance(value, str):
         return json.loads(value)
@@ -19,7 +16,7 @@ def _decode_jsonb(value):
 # We'll use them in responses
 
 
-async def _fetch_images_and_comments(conn, find_uuids: list):
+async def _fetch_images_and_comments(conn: Any, find_uuids: List[Any]) -> Tuple[Dict[str, list], Dict[str, list]]:
     """Batch-fetch images and comments for a list of find UUID objects."""
     if not find_uuids:
         return {}, {}
@@ -37,7 +34,7 @@ async def _fetch_images_and_comments(conn, find_uuids: list):
     comment_user_ids = [row["user_id"] for row in cmt_rows]
     comment_nicknames = await _fetch_display_nicknames(conn, comment_user_ids)
 
-    images_by_id: dict = {}
+    images_by_id: Dict[str, list] = {}
     for r in img_rows:
         fid = str(r["find_id"])
         images_by_id.setdefault(fid, []).append({
@@ -46,7 +43,7 @@ async def _fetch_images_and_comments(conn, find_uuids: list):
             "storageRef": r["storage_ref"],
         })
 
-    comments_by_id: dict = {}
+    comments_by_id: Dict[str, list] = {}
     for r in cmt_rows:
         fid = str(r["find_id"])
         comments_by_id.setdefault(fid, []).append({
@@ -60,7 +57,7 @@ async def _fetch_images_and_comments(conn, find_uuids: list):
     return images_by_id, comments_by_id
 
 
-async def _fetch_display_nicknames(conn, user_ids: list) -> dict:
+async def _fetch_display_nicknames(conn: Any, user_ids: List[Any]) -> Dict[str, str]:
     """Fetch display nicknames for a set of user UUIDs."""
     if not user_ids:
         return {}
@@ -72,6 +69,72 @@ async def _fetch_display_nicknames(conn, user_ids: list) -> dict:
     return {str(row["id"]): row["display_nickname"] for row in rows}
 
 
+def _apply_find_filters(
+    query: str,
+    params: List[Any],
+    cluster: Optional[str],
+    category: Optional[str],
+    from_date: Optional[datetime],
+    to_date: Optional[datetime],
+    period: Optional[str],
+) -> Tuple[str, List[Any]]:
+    """Apply common filters used by public/private find queries."""
+    if cluster:
+        query += f" AND cluster_hash = ${len(params) + 1}"
+        params.append(cluster)
+
+    if from_date:
+        query += f" AND date >= ${len(params) + 1}"
+        params.append(from_date)
+
+    if to_date:
+        query += f" AND date <= ${len(params) + 1}"
+        params.append(to_date)
+
+    if category:
+        segments = [seg for seg in category.split("/") if seg]
+        if segments:
+            query += f" AND category_paths @> ${len(params) + 1}::jsonb[]"
+            params.append(json.dumps([segments]))
+
+    if period:
+        query += f" AND period = ${len(params) + 1}"
+        params.append(period)
+
+    return query, params
+
+
+def _build_find_record(
+    row: Any,
+    fid: str,
+    nicknames_by_user_id: Dict[str, str],
+    images_by_id: Dict[str, list],
+    comments_by_id: Dict[str, list],
+    include_location: bool,
+) -> Dict[str, Any]:
+    """Build API record payload from a DB row."""
+    payload: Dict[str, Any] = {
+        "id": fid,
+        "userId": str(row["user_id"]),
+        "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
+        "date": row["date"],
+        "description": row["description"],
+        "clusterHash": row["cluster_hash"],
+        "categoryPaths": _decode_jsonb(row["category_paths"]),
+        "period": row["period"],
+        "images": images_by_id.get(fid, []),
+        "comments": comments_by_id.get(fid, []),
+    }
+
+    if include_location:
+        payload["location"] = {
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+        }
+
+    return payload
+
+
 async def query_public_finds(
     cluster: Optional[str] = None,
     category: Optional[str] = None,
@@ -79,10 +142,7 @@ async def query_public_finds(
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
 ) -> List[dict]:
-    """
-    Query public finds from database
-    Returns list of dicts that can be converted to PublicFindRecord
-    """
+    """Query public finds with shared filters."""
     conn = await get_db_connection()
     try:
         query = """
@@ -92,31 +152,16 @@ async def query_public_finds(
             FROM finds
             WHERE allow_public = TRUE
         """
-        params = []
-        
-        if cluster:
-            query += " AND cluster_hash = $" + str(len(params) + 1)
-            params.append(cluster)
-        
-        if from_date:
-            query += " AND date >= $" + str(len(params) + 1)
-            params.append(from_date)
-        
-        if to_date:
-            query += " AND date <= $" + str(len(params) + 1)
-            params.append(to_date)
-        
-        # Category filter: category_paths contains the segments
-        if category:
-            segments = [seg for seg in category.split("/") if seg]
-            if segments:
-                # JSONB array contains any subarray with those segments
-                query += " AND category_paths @> $" + str(len(params) + 1) + "::jsonb[]"
-                params.append(json.dumps([segments]))
-
-        if period:
-            query += " AND period = $" + str(len(params) + 1)
-            params.append(period)
+        params: List[Any] = []
+        query, params = _apply_find_filters(
+            query=query,
+            params=params,
+            cluster=cluster,
+            category=category,
+            from_date=from_date,
+            to_date=to_date,
+            period=period,
+        )
 
         query += " ORDER BY date DESC"
 
@@ -130,22 +175,20 @@ async def query_public_finds(
         results = []
         for row in rows:
             fid = str(row["id"])
-            results.append({
-                "id": fid,
-                "userId": str(row["user_id"]),
-                "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
-                "date": row["date"],
-                "description": row["description"],
-                "clusterHash": row["cluster_hash"],
-                "categoryPaths": _decode_jsonb(row["category_paths"]),
-                "period": row["period"],
-                "images": images_by_id.get(fid, []),
-                "comments": comments_by_id.get(fid, []),
-            })
+            results.append(
+                _build_find_record(
+                    row=row,
+                    fid=fid,
+                    nicknames_by_user_id=nicknames_by_user_id,
+                    images_by_id=images_by_id,
+                    comments_by_id=comments_by_id,
+                    include_location=False,
+                )
+            )
 
         return results
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def query_private_finds(
@@ -156,9 +199,7 @@ async def query_private_finds(
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
 ) -> List[dict]:
-    """
-    Query private finds for a specific user from database
-    """
+    """Query private finds for a specific user with shared filters."""
     conn = await get_db_connection()
     try:
         query = """
@@ -168,30 +209,16 @@ async def query_private_finds(
             FROM finds
             WHERE user_id = $1
         """
-        params = [user_id]
-        
-        if cluster:
-            query += " AND cluster_hash = $" + str(len(params) + 1)
-            params.append(cluster)
-        
-        if from_date:
-            query += " AND date >= $" + str(len(params) + 1)
-            params.append(from_date)
-        
-        if to_date:
-            query += " AND date <= $" + str(len(params) + 1)
-            params.append(to_date)
-        
-        # Category filter
-        if category:
-            segments = [seg for seg in category.split("/") if seg]
-            if segments:
-                query += " AND category_paths @> $" + str(len(params) + 1) + "::jsonb[]"
-                params.append(json.dumps([segments]))
-
-        if period:
-            query += " AND period = $" + str(len(params) + 1)
-            params.append(period)
+        params: List[Any] = [user_id]
+        query, params = _apply_find_filters(
+            query=query,
+            params=params,
+            cluster=cluster,
+            category=category,
+            from_date=from_date,
+            to_date=to_date,
+            period=period,
+        )
 
         query += " ORDER BY date DESC"
 
@@ -205,26 +232,20 @@ async def query_private_finds(
         results = []
         for row in rows:
             fid = str(row["id"])
-            results.append({
-                "id": fid,
-                "userId": str(row["user_id"]),
-                "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
-                "date": row["date"],
-                "description": row["description"],
-                "clusterHash": row["cluster_hash"],
-                "categoryPaths": _decode_jsonb(row["category_paths"]),
-                "period": row["period"],
-                "images": images_by_id.get(fid, []),
-                "comments": comments_by_id.get(fid, []),
-                "location": {
-                    "latitude": row["latitude"],
-                    "longitude": row["longitude"],
-                },
-            })
+            results.append(
+                _build_find_record(
+                    row=row,
+                    fid=fid,
+                    nicknames_by_user_id=nicknames_by_user_id,
+                    images_by_id=images_by_id,
+                    comments_by_id=comments_by_id,
+                    include_location=True,
+                )
+            )
 
         return results
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def query_finds_nearby(
@@ -256,10 +277,7 @@ async def insert_find(
     category_paths: List[List[str]],
     period: Optional[str] = None,
 ) -> dict:
-    """
-    Insert new find record into database
-    Returns dict representation of PrivateFindRecord
-    """
+    """Insert a new find record into database and return API payload."""
     conn = await get_db_connection()
     try:
         query = """
@@ -287,24 +305,16 @@ async def insert_find(
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
-        return {
-            "id": fid,
-            "userId": str(row["user_id"]),
-            "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
-            "date": row["date"],
-            "description": row["description"],
-            "clusterHash": row["cluster_hash"],
-            "categoryPaths": _decode_jsonb(row["category_paths"]),
-            "period": row["period"],
-            "images": images_by_id.get(fid, []),
-            "comments": comments_by_id.get(fid, []),
-            "location": {
-                "latitude": row["latitude"],
-                "longitude": row["longitude"],
-            },
-        }
+        return _build_find_record(
+            row=row,
+            fid=fid,
+            nicknames_by_user_id=nicknames_by_user_id,
+            images_by_id=images_by_id,
+            comments_by_id=comments_by_id,
+            include_location=True,
+        )
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
@@ -326,24 +336,16 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
-        return {
-            "id": fid,
-            "userId": str(row["user_id"]),
-            "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
-            "date": row["date"],
-            "description": row["description"],
-            "clusterHash": row["cluster_hash"],
-            "categoryPaths": _decode_jsonb(row["category_paths"]),
-            "period": row["period"],
-            "images": images_by_id.get(fid, []),
-            "comments": comments_by_id.get(fid, []),
-            "location": {
-                "latitude": row["latitude"],
-                "longitude": row["longitude"],
-            },
-        }
+        return _build_find_record(
+            row=row,
+            fid=fid,
+            nicknames_by_user_id=nicknames_by_user_id,
+            images_by_id=images_by_id,
+            comments_by_id=comments_by_id,
+            include_location=True,
+        )
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def get_user_profile(user_id: str) -> Optional[dict]:
@@ -400,7 +402,7 @@ async def get_user_profile(user_id: str) -> Optional[dict]:
             "badges": list(row["badges"] or []),
         }
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def ensure_user_profile(
@@ -429,7 +431,7 @@ async def ensure_user_profile(
             fallback_language_code,
         )
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
     profile = await get_user_profile(user_id)
     if profile is None:
@@ -451,8 +453,8 @@ async def update_user_profile(
     """Update editable profile fields for the given user."""
     conn = await get_db_connection()
     try:
-        set_parts = []
-        params: list = []
+        set_parts: List[str] = []
+        params: List[Any] = []
 
         if display_nickname is not None:
             params.append(display_nickname)
@@ -487,7 +489,7 @@ async def update_user_profile(
                 *params,
             )
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
     return await get_user_profile(user_id)
 
@@ -513,7 +515,7 @@ async def insert_find_images(find_id: str, images: List[dict]) -> List[dict]:
                 )
         return images
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def update_find(
@@ -529,8 +531,8 @@ async def update_find(
     """Update mutable fields of a find. Returns None if find does not exist."""
     conn = await get_db_connection()
     try:
-        set_parts = []
-        params: list = []
+        set_parts: List[str] = []
+        params: List[Any] = []
 
         if date is not None:
             params.append(date)
@@ -573,24 +575,16 @@ async def update_find(
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
-        return {
-            "id": fid,
-            "userId": str(row["user_id"]),
-            "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
-            "date": row["date"],
-            "description": row["description"],
-            "clusterHash": row["cluster_hash"],
-            "categoryPaths": _decode_jsonb(row["category_paths"]),
-            "period": row["period"],
-            "images": images_by_id.get(fid, []),
-            "comments": comments_by_id.get(fid, []),
-            "location": {
-                "latitude": row["latitude"],
-                "longitude": row["longitude"],
-            },
-        }
+        return _build_find_record(
+            row=row,
+            fid=fid,
+            nicknames_by_user_id=nicknames_by_user_id,
+            images_by_id=images_by_id,
+            comments_by_id=comments_by_id,
+            include_location=True,
+        )
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def delete_find(find_id: str, user_id: str) -> bool:
@@ -602,7 +596,7 @@ async def delete_find(find_id: str, user_id: str) -> bool:
         )
         return result == "DELETE 1"
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def query_clusters(
@@ -622,7 +616,7 @@ async def query_clusters(
             FROM finds
             WHERE allow_public = TRUE
         """
-        params: list = []
+        params: List[Any] = []
 
         if from_date is not None:
             params.append(from_date)
@@ -639,7 +633,7 @@ async def query_clusters(
 
         results = []
         for row in rows:
-            path_counts: dict = {}
+            path_counts: Dict[str, int] = {}
             for find_paths in (row["all_paths"] or []):
                 if find_paths:
                     for path in find_paths:
@@ -660,4 +654,4 @@ async def query_clusters(
 
         return results
     finally:
-        await conn.close()
+        await release_db_connection(conn)

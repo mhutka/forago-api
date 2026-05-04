@@ -1,49 +1,28 @@
 """
-Database connection and utilities for ForaGo Backend
+Database connection and utilities for ForaGo Backend.
+Implements dependency injection pattern for FastAPI.
 """
 
 import os
 import ssl
-from typing import Optional, Any
-from dotenv import load_dotenv
+import logging
+from typing import Optional, Any, AsyncGenerator
+from contextlib import asynccontextmanager
 
-load_dotenv()
+from config import settings
 
-# Database connection settings
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_NAME = os.getenv("DB_NAME", "forago")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
-DB_STATEMENT_CACHE_SIZE = int(os.getenv("DB_STATEMENT_CACHE_SIZE", "0"))
+logger = logging.getLogger(__name__)
 
-
-def _resolve_db_ssl_mode() -> str:
-    """Resolve DB SSL mode from env.
-
-    Supported modes:
-    - disable: no TLS
-    - require: TLS without certificate verification
-    - verify-full: TLS with certificate verification
-    """
-    mode = os.getenv("DB_SSL_MODE", "").strip().lower()
-    if mode:
-        if mode in {"disable", "require", "verify-full"}:
-            return mode
-        raise RuntimeError("DB_SSL_MODE must be one of: disable, require, verify-full")
-
-    # Backward compatibility with DB_SSL boolean env.
-    raw_value = os.getenv("DB_SSL", "").strip().lower()
-    if raw_value:
-        enabled = raw_value in {"1", "true", "yes", "on", "require"}
-        return "require" if enabled else "disable"
-
-    return "require" if ENVIRONMENT == "production" else "disable"
+# Global connection pool
+_pool: Optional[Any] = None
 
 
 def _resolve_db_ssl_context() -> Any:
-    mode = _resolve_db_ssl_mode()
+    """Resolve SSL context for database connection."""
+    mode = settings.db_ssl_mode or (
+        "require" if settings.is_production() else "disable"
+    )
+
     if mode == "disable":
         return False
 
@@ -56,88 +35,157 @@ def _resolve_db_ssl_context() -> Any:
     return ssl.create_default_context()
 
 
-DB_SSL_MODE = _resolve_db_ssl_mode()
-DB_SSL = _resolve_db_ssl_context()
-
-# Global connection pool
-_pool: Optional[Any] = None
-
-
-async def init_db():
+async def init_db() -> None:
     """Initialize database connection pool."""
     import asyncpg  # lazy import – only needed in db mode
+
     global _pool
-    if _pool is None:
-        try:
-            _pool = await asyncpg.create_pool(
-                host=DB_HOST,
-                port=DB_PORT,
-                database=DB_NAME,
-                user=DB_USER,
-                password=DB_PASSWORD,
-                ssl=DB_SSL,
-                statement_cache_size=DB_STATEMENT_CACHE_SIZE,
-                min_size=5,
-                max_size=20,
-                command_timeout=60,
-            )
-            print(
-                f"✓ DB pool initialized: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME} "
-                f"(ssl_mode={DB_SSL_MODE}, statement_cache_size={DB_STATEMENT_CACHE_SIZE})"
-            )
-        except Exception as e:
-            print(f"✗ DB pool init failed: {e}")
-            raise
+    if _pool is not None:
+        logger.warning("Database pool already initialized")
+        return
+
+    try:
+        ssl_context = _resolve_db_ssl_context()
+        _pool = await asyncpg.create_pool(
+            host=settings.db_host,
+            port=settings.db_port,
+            database=settings.db_name,
+            user=settings.db_user,
+            password=settings.db_password,
+            ssl=ssl_context,
+            statement_cache_size=settings.db_statement_cache_size,
+            min_size=settings.db_pool_min_size,
+            max_size=settings.db_pool_max_size,
+            command_timeout=settings.db_command_timeout,
+        )
+        logger.info(
+            "DB pool initialized: %s@%s:%d/%s (min_size=%d, max_size=%d)",
+            settings.db_user,
+            settings.db_host,
+            settings.db_port,
+            settings.db_name,
+            settings.db_pool_min_size,
+            settings.db_pool_max_size,
+        )
+    except Exception as e:
+        logger.error("Database pool initialization failed: %s", e, exc_info=True)
+        raise
 
 
-async def close_db():
+async def close_db() -> None:
     """Close database connection pool."""
     global _pool
     if _pool is not None:
-        await _pool.close()
-        _pool = None
-        print("✓ DB pool closed")
+        try:
+            await _pool.close()
+            _pool = None
+            logger.info("DB pool closed")
+        except Exception as e:
+            logger.error("Error closing database pool: %s", e, exc_info=True)
+            raise
 
 
 def get_pool() -> Any:
-    """Get the global connection pool."""
+    """Get the global connection pool.
+
+    Returns:
+        asyncpg.Pool: Database connection pool
+
+    Raises:
+        RuntimeError: If pool not initialized
+    """
     if _pool is None:
-        raise RuntimeError("Database pool not initialized. Call init_db() first.")
+        raise RuntimeError(
+            "Database pool not initialized. Call init_db() first."
+        )
     return _pool
 
 
-async def run_migrations():
-    """Run SQL migrations from migrations/ folder."""
+async def get_db() -> AsyncGenerator[Any, None]:
+    """FastAPI dependency for database connections.
+
+    Yields:
+        asyncpg.Connection: Database connection from pool
+
+    Raises:
+        RuntimeError: If pool not initialized
+    """
     pool = get_pool()
-    migrations_dir = os.path.join(os.path.dirname(__file__), "migrations")
-    
-    if not os.path.exists(migrations_dir):
-        print(f"✗ Migrations directory not found: {migrations_dir}")
-        return
-    
-    # Get all .sql files in migrations/, sorted by name (lexicographic order ensures 001, 002, 003...)
-    migration_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith(".sql")])
-    
-    async with pool.acquire() as conn:
-        for filename in migration_files:
-            filepath = os.path.join(migrations_dir, filename)
-            with open(filepath, "r") as f:
-                sql = f.read()
-            try:
-                await conn.execute(sql)
-                print(f"✓ {filename} executed")
-            except Exception as e:
-                print(f"✗ {filename} failed: {e}")
-                raise
+    conn = await pool.acquire()
+    try:
+        yield conn
+    finally:
+        await pool.release(conn)
 
 
-async def get_db_connection():
-    """Get a single connection from the pool (for use in routes)."""
+@asynccontextmanager
+async def get_db_context() -> AsyncGenerator[Any, None]:
+    """Context manager for database connections.
+
+    Usage:
+        async with get_db_context() as conn:
+            result = await conn.fetch("SELECT ...")
+
+    Yields:
+        asyncpg.Connection: Database connection from pool
+    """
+    pool = get_pool()
+    conn = await pool.acquire()
+    try:
+        yield conn
+    finally:
+        await pool.release(conn)
+
+
+async def get_db_connection() -> Any:
+    """Backward-compatible helper returning one acquired DB connection.
+
+    Existing query helpers call this function directly and close/release later.
+    """
     pool = get_pool()
     return await pool.acquire()
 
 
-async def release_db_connection(conn):
-    """Release a pooled connection acquired via get_db_connection()."""
+async def release_db_connection(conn: Any) -> None:
+    """Backward-compatible helper to release an acquired DB connection."""
     pool = get_pool()
     await pool.release(conn)
+
+
+async def run_migrations() -> None:
+    """Run SQL migrations from migrations/ folder.
+
+    Migrations are executed in lexicographic order (001, 002, ...).
+    """
+    pool = get_pool()
+    migrations_dir = os.path.join(os.path.dirname(__file__), "migrations")
+
+    if not os.path.exists(migrations_dir):
+        logger.warning("Migrations directory not found: %s", migrations_dir)
+        return
+
+    # Get all .sql files, sorted by name
+    migration_files = sorted(
+        [f for f in os.listdir(migrations_dir) if f.endswith(".sql")]
+    )
+
+    if not migration_files:
+        logger.info("No migration files found")
+        return
+
+    async with pool.acquire() as conn:
+        for filename in migration_files:
+            filepath = os.path.join(migrations_dir, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    sql = f.read()
+                await conn.execute(sql)
+                logger.info("Migration executed: %s", filename)
+            except Exception as e:
+                logger.error(
+                    "Migration failed for %s: %s",
+                    filename,
+                    e,
+                    exc_info=True,
+                )
+                raise
