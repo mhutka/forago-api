@@ -77,6 +77,8 @@ def _apply_find_filters(
     from_date: Optional[datetime],
     to_date: Optional[datetime],
     period: Optional[str],
+    top_category_slug: Optional[str],
+    item_id: Optional[str],
 ) -> Tuple[str, List[Any]]:
     """Apply common filters used by public/private find queries."""
     if cluster:
@@ -101,6 +103,14 @@ def _apply_find_filters(
         query += f" AND period = ${len(params) + 1}"
         params.append(period)
 
+    if top_category_slug:
+        query += f" AND top_category_slug = ${len(params) + 1}"
+        params.append(top_category_slug)
+
+    if item_id:
+        query += f" AND find_item_id = ${len(params) + 1}::uuid"
+        params.append(item_id)
+
     return query, params
 
 
@@ -122,6 +132,8 @@ def _build_find_record(
         "clusterHash": row["cluster_hash"],
         "categoryPaths": _decode_jsonb(row["category_paths"]),
         "period": row["period"],
+        "topCategorySlug": row.get("top_category_slug") if hasattr(row, "get") else row["top_category_slug"],
+        "itemId": str(row["find_item_id"]) if row.get("find_item_id") is not None else None,
         "images": images_by_id.get(fid, []),
         "comments": comments_by_id.get(fid, []),
     }
@@ -141,6 +153,8 @@ async def query_public_finds(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
+    top_category_slug: Optional[str] = None,
+    item_id: Optional[str] = None,
 ) -> List[dict]:
     """Query public finds with shared filters."""
     conn = await get_db_connection()
@@ -148,7 +162,7 @@ async def query_public_finds(
         query = """
             SELECT 
                 id, user_id, date, description, cluster_hash,
-                category_paths, period, created_at
+                category_paths, period, top_category_slug, find_item_id, created_at
             FROM finds
             WHERE allow_public = TRUE
         """
@@ -161,6 +175,8 @@ async def query_public_finds(
             from_date=from_date,
             to_date=to_date,
             period=period,
+            top_category_slug=top_category_slug,
+            item_id=item_id,
         )
 
         query += " ORDER BY date DESC"
@@ -198,6 +214,8 @@ async def query_private_finds(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
+    top_category_slug: Optional[str] = None,
+    item_id: Optional[str] = None,
 ) -> List[dict]:
     """Query private finds for a specific user with shared filters."""
     conn = await get_db_connection()
@@ -205,7 +223,8 @@ async def query_private_finds(
         query = """
             SELECT 
                 id, user_id, date, description, cluster_hash,
-                latitude, longitude, category_paths, period, created_at
+                latitude, longitude, category_paths, period,
+                top_category_slug, find_item_id, created_at
             FROM finds
             WHERE user_id = $1
         """
@@ -218,6 +237,8 @@ async def query_private_finds(
             from_date=from_date,
             to_date=to_date,
             period=period,
+            top_category_slug=top_category_slug,
+            item_id=item_id,
         )
 
         query += " ORDER BY date DESC"
@@ -254,6 +275,8 @@ async def query_finds_nearby(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
+    top_category_slug: Optional[str] = None,
+    item_id: Optional[str] = None,
 ) -> List[dict]:
     """
     Query finds in a specific cluster (public view, no exact location)
@@ -264,11 +287,14 @@ async def query_finds_nearby(
         from_date=from_date,
         to_date=to_date,
         period=period,
+        top_category_slug=top_category_slug,
+        item_id=item_id,
     )
 
 
 async def insert_find(
     user_id: str,
+    app_variant_id: str,
     date: datetime,
     description: str,
     cluster_hash: str,
@@ -276,23 +302,28 @@ async def insert_find(
     longitude: float,
     category_paths: List[List[str]],
     period: Optional[str] = None,
+    top_category_slug: Optional[str] = None,
+    find_item_id: Optional[str] = None,
 ) -> dict:
     """Insert a new find record into database and return API payload."""
     conn = await get_db_connection()
     try:
         query = """
             INSERT INTO finds (
-                user_id, date, description, cluster_hash,
-                latitude, longitude, category_paths, period
+                user_id, app_variant_id, date, description, cluster_hash,
+                latitude, longitude, category_paths, period,
+                top_category_slug, find_item_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11::uuid)
             RETURNING id, user_id, date, description, cluster_hash,
-                      latitude, longitude, category_paths, period, created_at
+                      latitude, longitude, category_paths, period,
+                      top_category_slug, find_item_id, created_at
         """
 
         row = await conn.fetchrow(
             query,
             user_id,
+            app_variant_id,
             date,
             description,
             cluster_hash,
@@ -300,6 +331,8 @@ async def insert_find(
             longitude,
             json.dumps(category_paths),
             period,
+            top_category_slug,
+            find_item_id,
         )
 
         fid = str(row["id"])
@@ -324,7 +357,8 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
         row = await conn.fetchrow(
             """
             SELECT id, user_id, date, description, cluster_hash,
-                   latitude, longitude, category_paths, period
+                     latitude, longitude, category_paths, period,
+                     top_category_slug, find_item_id
             FROM finds WHERE id = $1::uuid AND user_id = $2::uuid
             """,
             find_id,
@@ -527,6 +561,8 @@ async def update_find(
     longitude: Optional[float] = None,
     category_paths: Optional[List[List[str]]] = None,
     period: Optional[str] = None,
+    top_category_slug: Optional[str] = None,
+    find_item_id: Optional[str] = None,
 ) -> Optional[dict]:
     """Update mutable fields of a find. Returns None if find does not exist."""
     conn = await get_db_connection()
@@ -552,6 +588,12 @@ async def update_find(
         if period is not None:
             params.append(period)
             set_parts.append(f"period = ${len(params)}")
+        if top_category_slug is not None:
+            params.append(top_category_slug)
+            set_parts.append(f"top_category_slug = ${len(params)}")
+        if find_item_id is not None:
+            params.append(find_item_id)
+            set_parts.append(f"find_item_id = ${len(params)}::uuid")
 
         if not set_parts:
             return await get_find_by_id(find_id, user_id)
@@ -565,7 +607,8 @@ async def update_find(
                         WHERE id = ${len(params) - 1}::uuid
                             AND user_id = ${len(params)}::uuid
             RETURNING id, user_id, date, description, cluster_hash,
-                      latitude, longitude, category_paths, period
+                      latitude, longitude, category_paths, period,
+                      top_category_slug, find_item_id
         """
 
         row = await conn.fetchrow(query, *params)
@@ -653,5 +696,207 @@ async def query_clusters(
             })
 
         return results
+    finally:
+        await release_db_connection(conn)
+
+
+async def get_user_active_variant(user_id: str) -> Optional[dict]:
+    """Resolve active/default app variant for a user."""
+    conn = await get_db_connection()
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT v.id, v.code, v.display_name, v.default_language_code,
+                   v.default_map_center_lat, v.default_map_center_lng,
+                   v.default_map_zoom, v.topmenu_icon_set, v.theme_tokens
+            FROM user_variant_memberships m
+            JOIN app_variants v ON v.id = m.app_variant_id
+            WHERE m.user_id = $1::uuid
+              AND m.is_active = TRUE
+              AND v.is_active = TRUE
+            ORDER BY m.is_default DESC, m.created_at ASC
+            LIMIT 1
+            """,
+            user_id,
+        )
+        if row is None:
+            return None
+        return {
+            "id": str(row["id"]),
+            "code": row["code"],
+            "displayName": row["display_name"],
+            "defaultLanguageCode": row["default_language_code"],
+            "defaultMapCenterLat": row["default_map_center_lat"],
+            "defaultMapCenterLng": row["default_map_center_lng"],
+            "defaultMapZoom": float(row["default_map_zoom"]),
+            "topmenuIconSet": row["topmenu_icon_set"],
+            "themeTokens": row["theme_tokens"],
+        }
+    finally:
+        await release_db_connection(conn)
+
+
+async def list_top_categories(app_variant_id: str, language_code: str) -> List[dict]:
+    """List top-level categories with localized labels for one variant."""
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT c.id, c.slug, c.icon_key, c.sort_order,
+                   COALESCE(ct.label, c.slug) AS label
+            FROM categories c
+            LEFT JOIN category_translations ct
+              ON ct.category_id = c.id
+             AND ct.language_code = $2
+            WHERE c.app_variant_id = $1::uuid
+              AND c.parent_category_id IS NULL
+              AND c.is_active = TRUE
+            ORDER BY c.sort_order ASC, c.slug ASC
+            """,
+            app_variant_id,
+            language_code,
+        )
+        return [
+            {
+                "id": str(r["id"]),
+                "slug": r["slug"],
+                "iconKey": r["icon_key"],
+                "label": r["label"],
+                "sortOrder": r["sort_order"],
+            }
+            for r in rows
+        ]
+    finally:
+        await release_db_connection(conn)
+
+
+async def list_category_items(
+    user_id: str,
+    app_variant_id: str,
+    language_code: str,
+    top_category_slug: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 200,
+) -> List[dict]:
+    """List category items in one feed (admin + approved + own items)."""
+    conn = await get_db_connection()
+    try:
+        sql = """
+            SELECT ci.id,
+                   ci.category_id,
+                   ci.canonical_key,
+                   ci.owner_type,
+                   ci.visibility_state,
+                   ci.approval_state,
+                   ci.promoted_to_admin,
+                   ci.image_url,
+                   ci.created_by_user_id,
+                   c.slug AS category_slug,
+                   COALESCE(p.slug, c.slug) AS top_category_slug,
+                   COALESCE(ct_top.label, COALESCE(p.slug, c.slug)) AS top_category_label,
+                   COALESCE(cit.title, ci.canonical_key, c.slug) AS title,
+                   cit.description_text
+            FROM category_items ci
+            JOIN categories c ON c.id = ci.category_id
+            LEFT JOIN categories p ON p.id = c.parent_category_id
+            LEFT JOIN category_item_translations cit
+              ON cit.item_id = ci.id
+             AND cit.language_code = $3
+            LEFT JOIN category_translations ct_top
+              ON ct_top.category_id = COALESCE(p.id, c.id)
+             AND ct_top.language_code = $3
+            WHERE ci.app_variant_id = $1::uuid
+              AND ci.visibility_state = 'visible'
+              AND (
+                    ci.owner_type = 'admin'
+                 OR ci.approval_state = 'approved'
+                 OR ci.created_by_user_id = $2::uuid
+              )
+        """
+        params: List[Any] = [app_variant_id, user_id, language_code]
+
+        if top_category_slug:
+            sql += f" AND COALESCE(p.slug, c.slug) = ${len(params) + 1}"
+            params.append(top_category_slug)
+
+        if q:
+            sql += f" AND (cit.search_tsv @@ websearch_to_tsquery('simple', ${len(params) + 1}) OR LOWER(COALESCE(cit.title, '')) LIKE LOWER(${len(params) + 2}))"
+            params.append(q)
+            params.append(f"%{q}%")
+
+        sql += f" ORDER BY COALESCE(p.slug, c.slug), cit.title NULLS LAST, ci.created_at DESC LIMIT ${len(params) + 1}"
+        params.append(limit)
+
+        rows = await conn.fetch(sql, *params)
+        return [
+            {
+                "id": str(r["id"]),
+                "categoryId": str(r["category_id"]),
+                "categorySlug": r["category_slug"],
+                "topCategorySlug": r["top_category_slug"],
+                "topCategoryLabel": r["top_category_label"],
+                "canonicalKey": r["canonical_key"],
+                "title": r["title"],
+                "descriptionText": r["description_text"],
+                "imageUrl": r["image_url"],
+                "ownerType": r["owner_type"],
+                "approvalState": r["approval_state"],
+                "promotedToAdmin": r["promoted_to_admin"],
+                "createdByUserId": str(r["created_by_user_id"]),
+            }
+            for r in rows
+        ]
+    finally:
+        await release_db_connection(conn)
+
+
+async def resolve_item_context(
+    user_id: str,
+    app_variant_id: str,
+    item_id: str,
+    language_code: str,
+) -> Optional[dict]:
+    """Validate item visibility and return top/category context for find creation."""
+    conn = await get_db_connection()
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT ci.id,
+                   ci.canonical_key,
+                   c.slug AS category_slug,
+                   COALESCE(p.slug, c.slug) AS top_category_slug,
+                   COALESCE(cit.title, ci.canonical_key, c.slug) AS item_title
+            FROM category_items ci
+            JOIN categories c ON c.id = ci.category_id
+            LEFT JOIN categories p ON p.id = c.parent_category_id
+            LEFT JOIN category_item_translations cit
+              ON cit.item_id = ci.id
+             AND cit.language_code = $4
+            WHERE ci.id = $3::uuid
+              AND ci.app_variant_id = $2::uuid
+              AND ci.visibility_state = 'visible'
+              AND (
+                    ci.owner_type = 'admin'
+                 OR ci.approval_state = 'approved'
+                 OR ci.created_by_user_id = $1::uuid
+              )
+            LIMIT 1
+            """,
+            user_id,
+            app_variant_id,
+            item_id,
+            language_code,
+        )
+        if row is None:
+            return None
+
+        item_key = row["canonical_key"] or str(row["id"])
+        return {
+            "itemId": str(row["id"]),
+            "topCategorySlug": row["top_category_slug"],
+            "categorySlug": row["category_slug"],
+            "itemTitle": row["item_title"],
+            "categoryPath": [[row["top_category_slug"], row["category_slug"], item_key]],
+        }
     finally:
         await release_db_connection(conn)

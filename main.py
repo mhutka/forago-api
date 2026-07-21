@@ -6,7 +6,7 @@ Main application file with routes and configuration.
 import logging
 import logging.handlers
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends, status, Request
@@ -32,6 +32,10 @@ from queries import (
     query_clusters,
     ensure_user_profile,
     get_user_profile,
+    get_user_active_variant,
+    list_top_categories,
+    list_category_items,
+    resolve_item_context,
     update_user_profile,
 )
 
@@ -126,6 +130,8 @@ class PublicFindRecord(BaseModel):
     description: str
     clusterHash: str
     period: Optional[str] = None
+    topCategorySlug: Optional[str] = None
+    itemId: Optional[str] = None
     images: List[RecordImageRef] = Field(default_factory=list)
     comments: List[RecordComment] = Field(default_factory=list)
 
@@ -205,6 +211,42 @@ class UpdateUserProfileRequest(BaseModel):
             raise ValueError("mapZoom must be between 1 and 22")
         return v
 
+
+class ActiveVariantResponse(BaseModel):
+    id: str
+    code: str
+    displayName: str
+    defaultLanguageCode: str
+    defaultMapCenterLat: float
+    defaultMapCenterLng: float
+    defaultMapZoom: float
+    topmenuIconSet: Dict[str, Any] = Field(default_factory=dict)
+    themeTokens: Dict[str, Any] = Field(default_factory=dict)
+
+
+class TopCategoryResponse(BaseModel):
+    id: str
+    slug: str
+    iconKey: Optional[str] = None
+    label: str
+    sortOrder: int
+
+
+class CategoryItemResponse(BaseModel):
+    id: str
+    categoryId: str
+    categorySlug: str
+    topCategorySlug: str
+    topCategoryLabel: str
+    canonicalKey: Optional[str] = None
+    title: str
+    descriptionText: Optional[str] = None
+    imageUrl: Optional[str] = None
+    ownerType: str
+    approvalState: str
+    promotedToAdmin: bool
+    createdByUserId: str
+
 VALID_PERIODS = {
     "JAN_1", "JAN_2", "FEB_1", "FEB_2", "MAR_1", "MAR_2",
     "APR_1", "APR_2", "MAY_1", "MAY_2", "JUN_1", "JUN_2",
@@ -219,6 +261,7 @@ class CreateFindRequest(BaseModel):
     description: str
     location: LatLng
     clusterHash: str
+    itemId: Optional[str] = None
     period: Optional[str] = None
 
     @field_validator('period')
@@ -234,6 +277,7 @@ class UpdateFindRequest(BaseModel):
     categoryPaths: Optional[List[List[str]]] = None
     description: Optional[str] = None
     location: Optional[LatLng] = None
+    itemId: Optional[str] = None
     period: Optional[str] = None
 
     @field_validator('period')
@@ -519,12 +563,115 @@ async def version_info():
         "dataSourceMode": settings.data_source_mode,
     }
 
+
+@app.get("/api/variants/active", response_model=ActiveVariantResponse)
+async def get_active_variant(current_user: AuthUser = Depends(get_current_user)):
+    """Return active/default variant context for authenticated user."""
+    try:
+        if settings.data_source_mode != "db":
+            return ActiveVariantResponse(
+                id="mock-variant-sk",
+                code="forago-sk",
+                displayName="ForaGo SK",
+                defaultLanguageCode="sk",
+                defaultMapCenterLat=48.1486,
+                defaultMapCenterLng=17.1077,
+                defaultMapZoom=11.0,
+                topmenuIconSet={
+                    "topCategories": [
+                        {"slug": "mushrooms", "iconKey": "mushroom"},
+                        {"slug": "herbs", "iconKey": "leaf"},
+                        {"slug": "birds", "iconKey": "bird"},
+                        {"slug": "fish", "iconKey": "fish"},
+                        {"slug": "butterflies", "iconKey": "butterfly"},
+                        {"slug": "insects", "iconKey": "insect"},
+                    ]
+                },
+                themeTokens={"primaryColor": "#2D6A4F", "radiusScale": 1.0},
+            )
+
+        variant = await get_user_active_variant(current_user.user_id)
+        if variant is None:
+            raise HTTPException(status_code=404, detail="No active variant found for user")
+        return ActiveVariantResponse(**variant)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load active variant: {str(e)}")
+
+
+@app.get("/api/categories/top", response_model=List[TopCategoryResponse])
+async def get_top_categories(current_user: AuthUser = Depends(get_current_user)):
+    """Return top-level categories for active user variant."""
+    try:
+        if settings.data_source_mode != "db":
+            return [
+                TopCategoryResponse(id="mock-mushrooms", slug="mushrooms", iconKey="mushroom", label="Huby", sortOrder=10),
+                TopCategoryResponse(id="mock-herbs", slug="herbs", iconKey="leaf", label="Bylinky", sortOrder=20),
+                TopCategoryResponse(id="mock-birds", slug="birds", iconKey="bird", label="Vtaky", sortOrder=30),
+                TopCategoryResponse(id="mock-fish", slug="fish", iconKey="fish", label="Ryby", sortOrder=40),
+                TopCategoryResponse(id="mock-butterflies", slug="butterflies", iconKey="butterfly", label="Motyle", sortOrder=50),
+                TopCategoryResponse(id="mock-insects", slug="insects", iconKey="insect", label="Hmyz", sortOrder=60),
+            ]
+
+        variant = await get_user_active_variant(current_user.user_id)
+        if variant is None:
+            raise HTTPException(status_code=404, detail="No active variant found for user")
+
+        profile = await get_user_profile(current_user.user_id)
+        language_code = (profile or {}).get("languageCode") or variant["defaultLanguageCode"]
+        rows = await list_top_categories(variant["id"], language_code)
+        return [TopCategoryResponse(**row) for row in rows]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load categories: {str(e)}")
+
+
+@app.get("/api/category-items", response_model=List[CategoryItemResponse])
+async def get_category_items(
+    topCategorySlug: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 200,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Single feed of category items: admin + approved + own (visible)."""
+    try:
+        if limit < 1 or limit > 500:
+            raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+
+        if settings.data_source_mode != "db":
+            return []
+
+        variant = await get_user_active_variant(current_user.user_id)
+        if variant is None:
+            raise HTTPException(status_code=404, detail="No active variant found for user")
+
+        profile = await get_user_profile(current_user.user_id)
+        language_code = (profile or {}).get("languageCode") or variant["defaultLanguageCode"]
+
+        rows = await list_category_items(
+            user_id=current_user.user_id,
+            app_variant_id=variant["id"],
+            language_code=language_code,
+            top_category_slug=topCategorySlug,
+            q=q,
+            limit=limit,
+        )
+        return [CategoryItemResponse(**row) for row in rows]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load category items: {str(e)}")
+
 # ---------- FINDS ENDPOINTS ----------
 
 @app.get("/api/finds/public", response_model=List[PublicFindRecord])
 async def get_public_finds(
     cluster: Optional[str] = None,
     category: Optional[str] = None,
+    topCategorySlug: Optional[str] = None,
+    itemId: Optional[str] = None,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
@@ -538,6 +685,8 @@ async def get_public_finds(
             results_data = await query_public_finds(
                 cluster=cluster,
                 category=category,
+                top_category_slug=topCategorySlug,
+                item_id=itemId,
                 from_date=from_date,
                 to_date=to_date,
                 period=period,
@@ -570,6 +719,8 @@ async def get_public_finds(
 async def get_finds_nearby(
     cluster: str,
     category: Optional[str] = None,
+    topCategorySlug: Optional[str] = None,
+    itemId: Optional[str] = None,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
@@ -580,6 +731,8 @@ async def get_finds_nearby(
             results_data = await query_finds_nearby(
                 cluster=cluster,
                 category=category,
+                top_category_slug=topCategorySlug,
+                item_id=itemId,
                 from_date=from_date,
                 to_date=to_date,
                 period=period,
@@ -613,6 +766,8 @@ async def get_finds_nearby(
 async def get_private_finds(
     cluster: Optional[str] = None,
     category: Optional[str] = None,
+    topCategorySlug: Optional[str] = None,
+    itemId: Optional[str] = None,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
@@ -630,6 +785,8 @@ async def get_private_finds(
                 user_id=effective_user_id,
                 cluster=cluster,
                 category=category,
+                top_category_slug=topCategorySlug,
+                item_id=itemId,
                 from_date=from_date,
                 to_date=to_date,
                 period=period,
@@ -673,15 +830,36 @@ async def create_find(
         effective_user_id = current_user.user_id
 
         if settings.data_source_mode == "db":
+            if not request.itemId:
+                raise HTTPException(status_code=400, detail="itemId is required. Use the 'unknown' item when needed.")
+
+            variant = await get_user_active_variant(effective_user_id)
+            if variant is None:
+                raise HTTPException(status_code=404, detail="No active variant found for user")
+
+            profile = await get_user_profile(effective_user_id)
+            language_code = (profile or {}).get("languageCode") or variant["defaultLanguageCode"]
+            item_context = await resolve_item_context(
+                user_id=effective_user_id,
+                app_variant_id=variant["id"],
+                item_id=request.itemId,
+                language_code=language_code,
+            )
+            if item_context is None:
+                raise HTTPException(status_code=400, detail="Invalid or inaccessible itemId")
+
             result_data = await insert_find(
                 user_id=effective_user_id,
+                app_variant_id=variant["id"],
                 date=request.date,
                 description=request.description,
                 cluster_hash=request.clusterHash,
                 latitude=request.location.latitude,
                 longitude=request.location.longitude,
-                category_paths=request.categoryPaths,
+                category_paths=request.categoryPaths or item_context["categoryPath"],
                 period=request.period,
+                top_category_slug=item_context["topCategorySlug"],
+                find_item_id=item_context["itemId"],
             )
             return PrivateFindRecord(**result_data)
         else:
@@ -694,6 +872,7 @@ async def create_find(
                 description=request.description,
                 clusterHash=request.clusterHash,
                 location=request.location,
+                itemId=request.itemId,
                 period=request.period,
             )
             MOCK_FINDS[new_find.id] = new_find
@@ -801,6 +980,30 @@ async def update_find(
     """Update find"""
     try:
         if settings.data_source_mode == "db":
+            item_context = None
+            top_category_slug = None
+            find_item_id = None
+            category_paths = request.categoryPaths
+
+            if request.itemId is not None:
+                variant = await get_user_active_variant(current_user.user_id)
+                if variant is None:
+                    raise HTTPException(status_code=404, detail="No active variant found for user")
+                profile = await get_user_profile(current_user.user_id)
+                language_code = (profile or {}).get("languageCode") or variant["defaultLanguageCode"]
+                item_context = await resolve_item_context(
+                    user_id=current_user.user_id,
+                    app_variant_id=variant["id"],
+                    item_id=request.itemId,
+                    language_code=language_code,
+                )
+                if item_context is None:
+                    raise HTTPException(status_code=400, detail="Invalid or inaccessible itemId")
+                top_category_slug = item_context["topCategorySlug"]
+                find_item_id = item_context["itemId"]
+                if category_paths is None:
+                    category_paths = item_context["categoryPath"]
+
             result = await db_update_find(
                 find_id=find_id,
                 user_id=current_user.user_id,
@@ -808,8 +1011,10 @@ async def update_find(
                 description=request.description,
                 latitude=request.location.latitude if request.location else None,
                 longitude=request.location.longitude if request.location else None,
-                category_paths=request.categoryPaths,
+                category_paths=category_paths,
                 period=request.period,
+                top_category_slug=top_category_slug,
+                find_item_id=find_item_id,
             )
             if result is None:
                 raise HTTPException(status_code=404, detail="Find not found")
@@ -826,6 +1031,7 @@ async def update_find(
                     "categoryPaths": request.categoryPaths,
                     "description": request.description,
                     "location": request.location,
+                    "itemId": request.itemId,
                     "period": request.period,
                 }.items() if v is not None
             })
