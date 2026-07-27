@@ -206,3 +206,36 @@ Expected response:
 - [ ] Implement DELETE/UPDATE endpoints (currently stub)
 - [x] Add JWT authentication
 - [ ] Fetch images and comments from related tables
+
+## Import Mushroom Items From CSV
+
+Prepared script path:
+
+- `scripts/import_mushrooms_from_csv.sql`
+
+Run in `psql`:
+
+```sql
+\set csv_path 'C:/Users/Pc/Desktop/FLUTTER/forago/forago/huby.csv'
+\i c:/Users/Pc/Desktop/FLUTTER/forago_backend/scripts/import_mushrooms_from_csv.sql
+```
+
+Post-import checks:
+
+```sql
+SELECT v.code, COUNT(*) AS item_count
+FROM category_items ci
+JOIN categories c ON c.id = ci.category_id
+JOIN app_variants v ON v.id = ci.app_variant_id
+WHERE c.slug = 'mushrooms'
+GROUP BY v.code
+ORDER BY v.code;
+
+SELECT language_code, COUNT(*) AS translation_count
+FROM category_item_translations cit
+JOIN category_items ci ON ci.id = cit.item_id
+JOIN categories c ON c.id = ci.category_id
+WHERE c.slug = 'mushrooms'
+GROUP BY language_code
+ORDER BY language_code;
+```
