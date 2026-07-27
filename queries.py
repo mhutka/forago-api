@@ -57,6 +57,44 @@ async def _fetch_images_and_comments(conn: Any, find_uuids: List[Any]) -> Tuple[
     return images_by_id, comments_by_id
 
 
+async def _fetch_find_tag_item_ids(conn: Any, find_uuids: List[Any]) -> Dict[str, List[str]]:
+    """Batch-fetch category item tag ids for a list of finds."""
+    if not find_uuids:
+        return {}
+
+    rows = await conn.fetch(
+        "SELECT find_id, category_item_id "
+        "FROM find_tag_items "
+        "WHERE find_id = ANY($1::uuid[]) "
+        "ORDER BY created_at ASC, category_item_id ASC",
+        find_uuids,
+    )
+
+    tag_item_ids_by_find_id: Dict[str, List[str]] = {}
+    for row in rows:
+        fid = str(row["find_id"])
+        tag_item_ids_by_find_id.setdefault(fid, []).append(str(row["category_item_id"]))
+
+    return tag_item_ids_by_find_id
+
+
+async def _replace_find_tag_items(conn: Any, find_id: Any, tag_item_ids: List[str]) -> None:
+    """Replace item-tag rows for one find."""
+    await conn.execute("DELETE FROM find_tag_items WHERE find_id = $1::uuid", find_id)
+
+    if not tag_item_ids:
+        return
+
+    await conn.executemany(
+        """
+        INSERT INTO find_tag_items (find_id, category_item_id)
+        VALUES ($1::uuid, $2::uuid)
+        ON CONFLICT (find_id, category_item_id) DO NOTHING
+        """,
+        [(find_id, tag_item_id) for tag_item_id in tag_item_ids],
+    )
+
+
 async def _fetch_display_nicknames(conn: Any, user_ids: List[Any]) -> Dict[str, str]:
     """Fetch display nicknames for a set of user UUIDs."""
     if not user_ids:
@@ -79,6 +117,7 @@ def _apply_find_filters(
     period: Optional[str],
     top_category_slug: Optional[str],
     item_id: Optional[str],
+    tag_item_ids: Optional[List[str]] = None,
 ) -> Tuple[str, List[Any]]:
     """Apply common filters used by public/private find queries."""
     if cluster:
@@ -108,8 +147,20 @@ def _apply_find_filters(
         params.append(top_category_slug)
 
     if item_id:
-        query += f" AND find_item_id = ${len(params) + 1}::uuid"
+        query += (
+            f" AND (find_item_id = ${len(params) + 1}::uuid "
+            f"OR EXISTS (SELECT 1 FROM find_tag_items fti "
+            f"WHERE fti.find_id = finds.id AND fti.category_item_id = ${len(params) + 1}::uuid))"
+        )
         params.append(item_id)
+
+    if tag_item_ids:
+        query += (
+            f" AND (find_item_id = ANY(${len(params) + 1}::uuid[]) "
+            f"OR EXISTS (SELECT 1 FROM find_tag_items fti "
+            f"WHERE fti.find_id = finds.id AND fti.category_item_id = ANY(${len(params) + 1}::uuid[])))"
+        )
+        params.append(tag_item_ids)
 
     return query, params
 
@@ -120,6 +171,7 @@ def _build_find_record(
     nicknames_by_user_id: Dict[str, str],
     images_by_id: Dict[str, list],
     comments_by_id: Dict[str, list],
+    tag_item_ids_by_find_id: Dict[str, List[str]],
     include_location: bool,
 ) -> Dict[str, Any]:
     """Build API record payload from a DB row."""
@@ -134,6 +186,7 @@ def _build_find_record(
         "period": row["period"],
         "topCategorySlug": row.get("top_category_slug") if hasattr(row, "get") else row["top_category_slug"],
         "itemId": str(row["find_item_id"]) if row.get("find_item_id") is not None else None,
+        "tagItemIds": tag_item_ids_by_find_id.get(fid, []),
         "images": images_by_id.get(fid, []),
         "comments": comments_by_id.get(fid, []),
     }
@@ -155,6 +208,7 @@ async def query_public_finds(
     period: Optional[str] = None,
     top_category_slug: Optional[str] = None,
     item_id: Optional[str] = None,
+    tag_item_ids: Optional[List[str]] = None,
 ) -> List[dict]:
     """Query public finds with shared filters."""
     conn = await get_db_connection()
@@ -177,6 +231,7 @@ async def query_public_finds(
             period=period,
             top_category_slug=top_category_slug,
             item_id=item_id,
+            tag_item_ids=tag_item_ids,
         )
 
         query += " ORDER BY date DESC"
@@ -186,6 +241,7 @@ async def query_public_finds(
         find_uuids = [row["id"] for row in rows]
         owner_ids = [row["user_id"] for row in rows]
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
+        tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
         nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
 
         results = []
@@ -198,6 +254,7 @@ async def query_public_finds(
                     nicknames_by_user_id=nicknames_by_user_id,
                     images_by_id=images_by_id,
                     comments_by_id=comments_by_id,
+                    tag_item_ids_by_find_id=tag_item_ids_by_find_id,
                     include_location=False,
                 )
             )
@@ -216,6 +273,7 @@ async def query_private_finds(
     period: Optional[str] = None,
     top_category_slug: Optional[str] = None,
     item_id: Optional[str] = None,
+    tag_item_ids: Optional[List[str]] = None,
 ) -> List[dict]:
     """Query private finds for a specific user with shared filters."""
     conn = await get_db_connection()
@@ -239,6 +297,7 @@ async def query_private_finds(
             period=period,
             top_category_slug=top_category_slug,
             item_id=item_id,
+            tag_item_ids=tag_item_ids,
         )
 
         query += " ORDER BY date DESC"
@@ -248,6 +307,7 @@ async def query_private_finds(
         find_uuids = [row["id"] for row in rows]
         owner_ids = [row["user_id"] for row in rows]
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
+        tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
         nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
 
         results = []
@@ -260,6 +320,7 @@ async def query_private_finds(
                     nicknames_by_user_id=nicknames_by_user_id,
                     images_by_id=images_by_id,
                     comments_by_id=comments_by_id,
+                    tag_item_ids_by_find_id=tag_item_ids_by_find_id,
                     include_location=True,
                 )
             )
@@ -277,6 +338,7 @@ async def query_finds_nearby(
     period: Optional[str] = None,
     top_category_slug: Optional[str] = None,
     item_id: Optional[str] = None,
+    tag_item_ids: Optional[List[str]] = None,
 ) -> List[dict]:
     """
     Query finds in a specific cluster (public view, no exact location)
@@ -289,6 +351,7 @@ async def query_finds_nearby(
         period=period,
         top_category_slug=top_category_slug,
         item_id=item_id,
+        tag_item_ids=tag_item_ids,
     )
 
 
@@ -304,6 +367,7 @@ async def insert_find(
     period: Optional[str] = None,
     top_category_slug: Optional[str] = None,
     find_item_id: Optional[str] = None,
+    tag_item_ids: Optional[List[str]] = None,
 ) -> dict:
     """Insert a new find record into database and return API payload."""
     conn = await get_db_connection()
@@ -335,8 +399,13 @@ async def insert_find(
             find_item_id,
         )
 
+        effective_tag_item_ids = tag_item_ids or ([find_item_id] if find_item_id else [])
+        if effective_tag_item_ids:
+            await _replace_find_tag_items(conn, row["id"], effective_tag_item_ids)
+
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
+        tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
         return _build_find_record(
             row=row,
@@ -344,6 +413,7 @@ async def insert_find(
             nicknames_by_user_id=nicknames_by_user_id,
             images_by_id=images_by_id,
             comments_by_id=comments_by_id,
+            tag_item_ids_by_find_id=tag_item_ids_by_find_id,
             include_location=True,
         )
     finally:
@@ -369,6 +439,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
 
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
+        tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
         return _build_find_record(
             row=row,
@@ -376,6 +447,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
             nicknames_by_user_id=nicknames_by_user_id,
             images_by_id=images_by_id,
             comments_by_id=comments_by_id,
+            tag_item_ids_by_find_id=tag_item_ids_by_find_id,
             include_location=True,
         )
     finally:
@@ -563,6 +635,7 @@ async def update_find(
     period: Optional[str] = None,
     top_category_slug: Optional[str] = None,
     find_item_id: Optional[str] = None,
+    tag_item_ids: Optional[List[str]] = None,
 ) -> Optional[dict]:
     """Update mutable fields of a find. Returns None if find does not exist."""
     conn = await get_db_connection()
@@ -615,8 +688,12 @@ async def update_find(
         if row is None:
             return None
 
+        if tag_item_ids is not None:
+            await _replace_find_tag_items(conn, row["id"], tag_item_ids)
+
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
+        tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
         return _build_find_record(
             row=row,
@@ -624,6 +701,7 @@ async def update_find(
             nicknames_by_user_id=nicknames_by_user_id,
             images_by_id=images_by_id,
             comments_by_id=comments_by_id,
+            tag_item_ids_by_find_id=tag_item_ids_by_find_id,
             include_location=True,
         )
     finally:

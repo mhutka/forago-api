@@ -1,5 +1,6 @@
 import importlib
 import os
+import sys
 
 from fastapi.testclient import TestClient
 from jose import jwt
@@ -10,6 +11,9 @@ os.environ["DATA_SOURCE_MODE"] = "mock"
 os.environ["ENVIRONMENT"] = "development"
 os.environ["JWT_SECRET_KEY"] = "test-secret-key"
 os.environ["JWT_ALGORITHMS"] = "HS256"
+
+sys.modules.pop("config", None)
+sys.modules.pop("main", None)
 
 main = importlib.import_module("main")
 client = TestClient(main.app)
@@ -39,6 +43,7 @@ def test_create_find_rejects_invalid_period():
             "description": "Smoke test record",
             "location": {"latitude": 48.14, "longitude": 17.11},
             "clusterHash": "48.14_17.11",
+            "tagItemIds": ["unknown-mushrooms"],
             "period": "INVALID_PERIOD",
         },
     )
@@ -70,12 +75,14 @@ def test_create_and_list_private_finds_with_valid_jwt():
             "description": "Smoke test record",
             "location": {"latitude": 48.14, "longitude": 17.11},
             "clusterHash": "48.14_17.11",
+            "tagItemIds": ["unknown-mushrooms", "boletus-edulis"],
             "period": "MAR_2",
         },
     )
 
     assert create_response.status_code == 201
     created_id = create_response.json()["id"]
+    assert create_response.json()["tagItemIds"] == ["unknown-mushrooms", "boletus-edulis"]
 
     list_response = client.get("/api/finds/private", headers=auth_headers(user_id))
     assert list_response.status_code == 200

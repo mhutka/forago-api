@@ -19,6 +19,9 @@ def test_apply_find_filters_builds_expected_sql_and_params():
         from_date=datetime(2026, 1, 1),
         to_date=datetime(2026, 2, 1),
         period="JAN_2",
+        top_category_slug="mushrooms",
+        item_id="00000000-0000-0000-0000-000000000123",
+        tag_item_ids=["00000000-0000-0000-0000-000000000124"],
     )
 
     assert "cluster_hash = $1" in query
@@ -26,8 +29,14 @@ def test_apply_find_filters_builds_expected_sql_and_params():
     assert "date <= $3" in query
     assert "category_paths @> $4::jsonb[]" in query
     assert "period = $5" in query
+    assert "top_category_slug = $6" in query
+    assert "find_item_id = $7::uuid" in query
+    assert "find_item_id = ANY($8::uuid[])" in query
     assert out_params[0] == "48.14_17.11"
     assert out_params[4] == "JAN_2"
+    assert out_params[5] == "mushrooms"
+    assert out_params[6] == "00000000-0000-0000-0000-000000000123"
+    assert out_params[7] == ["00000000-0000-0000-0000-000000000124"]
 
 
 def test_build_find_record_includes_location_only_when_requested():
@@ -41,6 +50,8 @@ def test_build_find_record_includes_location_only_when_requested():
         "period": "JAN_1",
         "latitude": 48.14,
         "longitude": 17.11,
+        "top_category_slug": "mushrooms",
+        "find_item_id": "00000000-0000-0000-0000-000000000123",
     }
 
     with_location = _build_find_record(
@@ -49,6 +60,7 @@ def test_build_find_record_includes_location_only_when_requested():
         nicknames_by_user_id={"u1": "nick"},
         images_by_id={"a": [{"thumbnailUrl": "t", "fullUrl": "f", "storageRef": None}]},
         comments_by_id={"a": []},
+        tag_item_ids_by_find_id={"a": ["00000000-0000-0000-0000-000000000123"]},
         include_location=True,
     )
     without_location = _build_find_record(
@@ -57,11 +69,13 @@ def test_build_find_record_includes_location_only_when_requested():
         nicknames_by_user_id={"u1": "nick"},
         images_by_id={"a": []},
         comments_by_id={"a": []},
+        tag_item_ids_by_find_id={"a": ["00000000-0000-0000-0000-000000000123"]},
         include_location=False,
     )
 
     assert "location" in with_location
     assert with_location["location"]["latitude"] == 48.14
+    assert with_location["tagItemIds"] == ["00000000-0000-0000-0000-000000000123"]
     assert "location" not in without_location
 
 

@@ -132,6 +132,7 @@ class PublicFindRecord(BaseModel):
     period: Optional[str] = None
     topCategorySlug: Optional[str] = None
     itemId: Optional[str] = None
+    tagItemIds: List[str] = Field(default_factory=list)
     images: List[RecordImageRef] = Field(default_factory=list)
     comments: List[RecordComment] = Field(default_factory=list)
 
@@ -262,6 +263,7 @@ class CreateFindRequest(BaseModel):
     location: LatLng
     clusterHash: str
     itemId: Optional[str] = None
+    tagItemIds: Optional[List[str]] = None
     period: Optional[str] = None
 
     @field_validator('period')
@@ -278,6 +280,7 @@ class UpdateFindRequest(BaseModel):
     description: Optional[str] = None
     location: Optional[LatLng] = None
     itemId: Optional[str] = None
+    tagItemIds: Optional[List[str]] = None
     period: Optional[str] = None
 
     @field_validator('period')
@@ -307,6 +310,52 @@ class PresignFindImagesResponse(BaseModel):
 
 class AttachFindImagesRequest(BaseModel):
     images: List[RecordImageRef]
+
+
+def _normalize_tag_item_ids(tag_item_ids: Optional[List[str]], item_id: Optional[str]) -> List[str]:
+    """Merge legacy primary item and new tag items into a deduplicated list."""
+    normalized: List[str] = []
+    seen = set()
+
+    for candidate in ([item_id] if item_id is not None else []) + list(tag_item_ids or []):
+        value = candidate.strip() if isinstance(candidate, str) else ""
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+
+    return normalized
+
+
+async def _resolve_tag_item_contexts(
+    *,
+    user_id: str,
+    app_variant_id: str,
+    language_code: str,
+    tag_item_ids: List[str],
+) -> List[Dict[str, Any]]:
+    """Resolve all requested tag items and ensure they stay within one top category."""
+    contexts: List[Dict[str, Any]] = []
+
+    for tag_item_id in tag_item_ids:
+        item_context = await resolve_item_context(
+            user_id=user_id,
+            app_variant_id=app_variant_id,
+            item_id=tag_item_id,
+            language_code=language_code,
+        )
+        if item_context is None:
+            raise HTTPException(status_code=400, detail="Invalid or inaccessible itemId")
+        contexts.append(item_context)
+
+    top_category_slugs = {context["topCategorySlug"] for context in contexts}
+    if len(top_category_slugs) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="All tagged items must belong to the same top category",
+        )
+
+    return contexts
 
 # ============ MOCK DATA (temporary) ============
 MOCK_FINDS = {
@@ -672,6 +721,7 @@ async def get_public_finds(
     category: Optional[str] = None,
     topCategorySlug: Optional[str] = None,
     itemId: Optional[str] = None,
+    tagItemIds: Optional[List[str]] = None,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
@@ -687,6 +737,7 @@ async def get_public_finds(
                 category=category,
                 top_category_slug=topCategorySlug,
                 item_id=itemId,
+                tag_item_ids=tagItemIds,
                 from_date=from_date,
                 to_date=to_date,
                 period=period,
@@ -721,6 +772,7 @@ async def get_finds_nearby(
     category: Optional[str] = None,
     topCategorySlug: Optional[str] = None,
     itemId: Optional[str] = None,
+    tagItemIds: Optional[List[str]] = None,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
@@ -733,6 +785,7 @@ async def get_finds_nearby(
                 category=category,
                 top_category_slug=topCategorySlug,
                 item_id=itemId,
+                tag_item_ids=tagItemIds,
                 from_date=from_date,
                 to_date=to_date,
                 period=period,
@@ -768,6 +821,7 @@ async def get_private_finds(
     category: Optional[str] = None,
     topCategorySlug: Optional[str] = None,
     itemId: Optional[str] = None,
+    tagItemIds: Optional[List[str]] = None,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
@@ -787,6 +841,7 @@ async def get_private_finds(
                 category=category,
                 top_category_slug=topCategorySlug,
                 item_id=itemId,
+                tag_item_ids=tagItemIds,
                 from_date=from_date,
                 to_date=to_date,
                 period=period,
@@ -830,8 +885,9 @@ async def create_find(
         effective_user_id = current_user.user_id
 
         if settings.data_source_mode == "db":
-            if not request.itemId:
-                raise HTTPException(status_code=400, detail="itemId is required. Use the 'unknown' item when needed.")
+            tag_item_ids = _normalize_tag_item_ids(request.tagItemIds, request.itemId)
+            if not tag_item_ids:
+                raise HTTPException(status_code=400, detail="At least one tag item is required. Use the 'unknown' item when needed.")
 
             variant = await get_user_active_variant(effective_user_id)
             if variant is None:
@@ -839,14 +895,15 @@ async def create_find(
 
             profile = await get_user_profile(effective_user_id)
             language_code = (profile or {}).get("languageCode") or variant["defaultLanguageCode"]
-            item_context = await resolve_item_context(
+            item_contexts = await _resolve_tag_item_contexts(
                 user_id=effective_user_id,
                 app_variant_id=variant["id"],
-                item_id=request.itemId,
                 language_code=language_code,
+                tag_item_ids=tag_item_ids,
             )
-            if item_context is None:
-                raise HTTPException(status_code=400, detail="Invalid or inaccessible itemId")
+            primary_item_id = request.itemId or item_contexts[0]["itemId"]
+            derived_category_paths = [context["categoryPath"][0] for context in item_contexts]
+            top_category_slug = item_contexts[0]["topCategorySlug"]
 
             result_data = await insert_find(
                 user_id=effective_user_id,
@@ -856,10 +913,11 @@ async def create_find(
                 cluster_hash=request.clusterHash,
                 latitude=request.location.latitude,
                 longitude=request.location.longitude,
-                category_paths=request.categoryPaths or item_context["categoryPath"],
+                category_paths=request.categoryPaths or derived_category_paths,
                 period=request.period,
-                top_category_slug=item_context["topCategorySlug"],
-                find_item_id=item_context["itemId"],
+                top_category_slug=top_category_slug,
+                find_item_id=primary_item_id,
+                tag_item_ids=tag_item_ids,
             )
             return PrivateFindRecord(**result_data)
         else:
@@ -873,6 +931,7 @@ async def create_find(
                 clusterHash=request.clusterHash,
                 location=request.location,
                 itemId=request.itemId,
+                tagItemIds=_normalize_tag_item_ids(request.tagItemIds, request.itemId),
                 period=request.period,
             )
             MOCK_FINDS[new_find.id] = new_find
@@ -983,26 +1042,29 @@ async def update_find(
             item_context = None
             top_category_slug = None
             find_item_id = None
+            tag_item_ids = None
             category_paths = request.categoryPaths
 
-            if request.itemId is not None:
+            if request.itemId is not None or request.tagItemIds is not None:
                 variant = await get_user_active_variant(current_user.user_id)
                 if variant is None:
                     raise HTTPException(status_code=404, detail="No active variant found for user")
                 profile = await get_user_profile(current_user.user_id)
                 language_code = (profile or {}).get("languageCode") or variant["defaultLanguageCode"]
-                item_context = await resolve_item_context(
+                tag_item_ids = _normalize_tag_item_ids(request.tagItemIds, request.itemId)
+                if not tag_item_ids:
+                    raise HTTPException(status_code=400, detail="At least one tag item is required when updating item tags")
+                item_contexts = await _resolve_tag_item_contexts(
                     user_id=current_user.user_id,
                     app_variant_id=variant["id"],
-                    item_id=request.itemId,
                     language_code=language_code,
+                    tag_item_ids=tag_item_ids,
                 )
-                if item_context is None:
-                    raise HTTPException(status_code=400, detail="Invalid or inaccessible itemId")
+                item_context = item_contexts[0]
                 top_category_slug = item_context["topCategorySlug"]
-                find_item_id = item_context["itemId"]
+                find_item_id = request.itemId or item_context["itemId"]
                 if category_paths is None:
-                    category_paths = item_context["categoryPath"]
+                    category_paths = [context["categoryPath"][0] for context in item_contexts]
 
             result = await db_update_find(
                 find_id=find_id,
@@ -1015,6 +1077,7 @@ async def update_find(
                 period=request.period,
                 top_category_slug=top_category_slug,
                 find_item_id=find_item_id,
+                tag_item_ids=tag_item_ids,
             )
             if result is None:
                 raise HTTPException(status_code=404, detail="Find not found")
@@ -1032,6 +1095,7 @@ async def update_find(
                     "description": request.description,
                     "location": request.location,
                     "itemId": request.itemId,
+                    "tagItemIds": _normalize_tag_item_ids(request.tagItemIds, request.itemId) if request.itemId is not None or request.tagItemIds is not None else existing.tagItemIds,
                     "period": request.period,
                 }.items() if v is not None
             })
