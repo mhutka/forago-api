@@ -2,7 +2,8 @@
 --
 -- What this does:
 -- 1) Loads raw CSV rows into a temp table.
--- 2) Cleans data: removes missing Slovak names, invalid Latin rows, and duplicates.
+-- 2) Cleans data: removes missing Slovak names and duplicates; Latin name is optional.
+-- 2b) Adds first-word aliases from Slovak names (e.g. "Smrcok obycajny" -> "Smrcok").
 -- 3) Upserts items into category_items for mushrooms in forago-sk + forago-cz variants.
 -- 4) Upserts SK/CS translations.
 -- 5) Assigns optional badges from Typ (edible/inedible/poisonous).
@@ -25,11 +26,8 @@ CREATE TEMP TABLE tmp_huby_raw (
     mesiace TEXT
 ) ON COMMIT DROP;
 
--- psql meta-command (must run via psql):
-\copy tmp_huby_raw (slovensky, latinsky, cesky, typ, mesiace)
-FROM :'csv_path'
-WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');
-
+-- psql meta-command (must be on a single line):
+\copy tmp_huby_raw (slovensky, latinsky, cesky, typ, mesiace) FROM :csv_path WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');
 CREATE TEMP TABLE tmp_huby_clean AS
 WITH normalized AS (
     SELECT
@@ -62,9 +60,11 @@ WITH normalized AS (
         END AS badge_code
     FROM standardized
     WHERE slovensky IS NOT NULL
-      AND latinsky IS NOT NULL
-      -- Keep likely scientific names, drop obvious non-mushroom content lines.
-      AND latinsky ~ '^[A-Z][A-Za-z.-]+( [a-z][A-Za-z.-]+){0,3}$'
+        -- Latin name can be missing; if present, keep only likely scientific names.
+        AND (
+            latinsky IS NULL
+           OR latinsky ~ '^[A-Z][A-Za-z.-]+( [a-z][A-Za-z.-]+){0,3}$'
+        )
 ), ranked AS (
     SELECT
         slovensky,
@@ -82,6 +82,67 @@ WITH normalized AS (
                 slovensky ASC
         ) AS rn
     FROM filtered
+), base_clean AS (
+    SELECT
+        slovensky,
+        latinsky,
+        cesky,
+        typ,
+        canonical_key,
+        badge_code
+    FROM ranked
+    WHERE rn = 1
+      AND canonical_key IS NOT NULL
+), with_aliases AS (
+    -- Add short generic aliases from the first word of Slovak title.
+    -- Badge is intentionally NULL for aliases to avoid ambiguous edible/poisonous labeling.
+    SELECT
+        bc.slovensky,
+        bc.latinsky,
+        bc.cesky,
+        bc.typ,
+        bc.canonical_key,
+        bc.badge_code,
+        FALSE AS is_alias
+    FROM base_clean bc
+
+    UNION ALL
+
+    SELECT
+        split_part(bc.slovensky, ' ', 1) AS slovensky,
+        NULL::TEXT AS latinsky,
+        NULL::TEXT AS cesky,
+        NULL::TEXT AS typ,
+        NULLIF(
+            REGEXP_REPLACE(
+                LOWER(REGEXP_REPLACE(split_part(bc.slovensky, ' ', 1), '\\s+', ' ', 'g')),
+                '[^a-zA-Z0-9]+',
+                '-',
+                'g'
+            ),
+            ''
+        ) AS canonical_key,
+        NULL::TEXT AS badge_code,
+        TRUE AS is_alias
+    FROM base_clean bc
+), alias_ranked AS (
+    SELECT
+        slovensky,
+        latinsky,
+        cesky,
+        typ,
+        canonical_key,
+        badge_code,
+        ROW_NUMBER() OVER (
+            PARTITION BY canonical_key
+            ORDER BY
+                is_alias ASC,
+                (latinsky IS NOT NULL) DESC,
+                LENGTH(slovensky) DESC,
+                slovensky ASC
+        ) AS rn
+    FROM with_aliases
+    WHERE canonical_key IS NOT NULL
 )
 SELECT
     slovensky,
@@ -90,7 +151,7 @@ SELECT
     typ,
     canonical_key,
     badge_code
-FROM ranked
+FROM alias_ranked
 WHERE rn = 1
   AND canonical_key IS NOT NULL;
 
@@ -161,7 +222,7 @@ SELECT
 FROM mushroom_categories mc
 CROSS JOIN creator cr
 CROSS JOIN tmp_huby_clean hc
-ON CONFLICT (category_id, canonical_key)
+ON CONFLICT (category_id, canonical_key) WHERE canonical_key IS NOT NULL
 DO UPDATE SET
     visibility_state = 'visible',
     approval_state = 'approved',
@@ -199,7 +260,14 @@ FROM (
         im.item_id,
         'sk'::TEXT AS language_code,
         im.slovensky AS title,
-        CONCAT('Latinsky: ', im.latinsky, COALESCE(' | Typ: ' || im.typ, '')) AS description_text
+        CONCAT(
+            COALESCE('Latinsky: ' || im.latinsky, ''),
+            CASE
+                WHEN im.latinsky IS NOT NULL AND im.typ IS NOT NULL THEN ' | '
+                ELSE ''
+            END,
+            COALESCE('Typ: ' || im.typ, '')
+        ) AS description_text
     FROM item_map im
 
     UNION ALL
@@ -208,7 +276,14 @@ FROM (
         im.item_id,
         'cs'::TEXT AS language_code,
         COALESCE(im.cesky, im.slovensky) AS title,
-        CONCAT('Latinsky: ', im.latinsky, COALESCE(' | Typ: ' || im.typ, '')) AS description_text
+        CONCAT(
+            COALESCE('Latinsky: ' || im.latinsky, ''),
+            CASE
+                WHEN im.latinsky IS NOT NULL AND im.typ IS NOT NULL THEN ' | '
+                ELSE ''
+            END,
+            COALESCE('Typ: ' || im.typ, '')
+        ) AS description_text
     FROM item_map im
 ) t
 ON CONFLICT (item_id, language_code)

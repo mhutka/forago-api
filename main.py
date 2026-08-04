@@ -682,12 +682,15 @@ async def get_category_items(
     topCategorySlug: Optional[str] = None,
     q: Optional[str] = None,
     limit: int = 200,
+    offset: int = 0,
     current_user: AuthUser = Depends(get_current_user),
 ):
     """Single feed of category items: admin + approved + own (visible)."""
     try:
         if limit < 1 or limit > 500:
             raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+        if offset < 0:
+            raise HTTPException(status_code=400, detail="offset must be >= 0")
 
         if settings.data_source_mode != "db":
             return []
@@ -706,6 +709,7 @@ async def get_category_items(
             top_category_slug=topCategorySlug,
             q=q,
             limit=limit,
+            offset=offset,
         )
         return [CategoryItemResponse(**row) for row in rows]
     except HTTPException:

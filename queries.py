@@ -855,6 +855,7 @@ async def list_category_items(
     top_category_slug: Optional[str] = None,
     q: Optional[str] = None,
     limit: int = 200,
+    offset: int = 0,
 ) -> List[dict]:
     """List category items in one feed (admin + approved + own items)."""
     conn = await get_db_connection()
@@ -902,8 +903,9 @@ async def list_category_items(
             params.append(q)
             params.append(f"%{q}%")
 
-        sql += f" ORDER BY COALESCE(p.slug, c.slug), cit.title NULLS LAST, ci.created_at DESC LIMIT ${len(params) + 1}"
+        sql += f" ORDER BY COALESCE(p.slug, c.slug), cit.title NULLS LAST, ci.created_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
         params.append(limit)
+        params.append(offset)
 
         rows = await conn.fetch(sql, *params)
         return [
