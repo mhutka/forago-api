@@ -66,12 +66,14 @@ def test_auth_me_returns_subject_from_token():
 
 def test_create_and_list_private_finds_with_valid_jwt():
     user_id = "00000000-0000-0000-0000-000000000111"
+    expected_title = "Hríb pod bukom"
     create_response = client.post(
         "/api/finds",
         headers=auth_headers(user_id),
         json={
             "date": "2026-03-25T10:00:00Z",
             "categoryPaths": [["nature", "forest"]],
+            "title": expected_title,
             "description": "Smoke test record",
             "location": {"latitude": 48.14, "longitude": 17.11},
             "clusterHash": "48.14_17.11",
@@ -82,12 +84,16 @@ def test_create_and_list_private_finds_with_valid_jwt():
 
     assert create_response.status_code == 201
     created_id = create_response.json()["id"]
+    assert create_response.json()["title"] == expected_title
     assert create_response.json()["tagItemIds"] == ["unknown-mushrooms", "boletus-edulis"]
 
     list_response = client.get("/api/finds/private", headers=auth_headers(user_id))
     assert list_response.status_code == 200
-    ids = [item["id"] for item in list_response.json()]
+    records = list_response.json()
+    ids = [item["id"] for item in records]
     assert created_id in ids
+    created_record = next(item for item in records if item["id"] == created_id)
+    assert created_record["title"] == expected_title
 
 
 def test_profile_endpoint_requires_authentication():

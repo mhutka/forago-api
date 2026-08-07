@@ -180,6 +180,7 @@ def _build_find_record(
         "userId": str(row["user_id"]),
         "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
         "date": row["date"],
+        "title": row.get("title") if hasattr(row, "get") else row["title"],
         "description": row["description"],
         "clusterHash": row["cluster_hash"],
         "categoryPaths": _decode_jsonb(row["category_paths"]),
@@ -215,7 +216,7 @@ async def query_public_finds(
     try:
         query = """
             SELECT 
-                id, user_id, date, description, cluster_hash,
+                id, user_id, date, title, description, cluster_hash,
                 category_paths, period, top_category_slug, find_item_id, created_at
             FROM finds
             WHERE allow_public = TRUE
@@ -280,7 +281,7 @@ async def query_private_finds(
     try:
         query = """
             SELECT 
-                id, user_id, date, description, cluster_hash,
+                id, user_id, date, title, description, cluster_hash,
                 latitude, longitude, category_paths, period,
                 top_category_slug, find_item_id, created_at
             FROM finds
@@ -359,6 +360,7 @@ async def insert_find(
     user_id: str,
     app_variant_id: str,
     date: datetime,
+    title: Optional[str],
     description: str,
     cluster_hash: str,
     latitude: float,
@@ -374,12 +376,12 @@ async def insert_find(
     try:
         query = """
             INSERT INTO finds (
-                user_id, app_variant_id, date, description, cluster_hash,
+                user_id, app_variant_id, date, title, description, cluster_hash,
                 latitude, longitude, category_paths, period,
                 top_category_slug, find_item_id
             )
-            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11::uuid)
-            RETURNING id, user_id, date, description, cluster_hash,
+            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::uuid)
+            RETURNING id, user_id, date, title, description, cluster_hash,
                       latitude, longitude, category_paths, period,
                       top_category_slug, find_item_id, created_at
         """
@@ -389,6 +391,7 @@ async def insert_find(
             user_id,
             app_variant_id,
             date,
+            title,
             description,
             cluster_hash,
             latitude,
@@ -426,7 +429,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
     try:
         row = await conn.fetchrow(
             """
-            SELECT id, user_id, date, description, cluster_hash,
+            SELECT id, user_id, date, title, description, cluster_hash,
                      latitude, longitude, category_paths, period,
                      top_category_slug, find_item_id
             FROM finds WHERE id = $1::uuid AND user_id = $2::uuid
@@ -628,6 +631,7 @@ async def update_find(
     find_id: str,
     user_id: str,
     date: Optional[datetime] = None,
+    title: Optional[str] = None,
     description: Optional[str] = None,
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
@@ -646,6 +650,9 @@ async def update_find(
         if date is not None:
             params.append(date)
             set_parts.append(f"date = ${len(params)}")
+        if title is not None:
+            params.append(title)
+            set_parts.append(f"title = ${len(params)}")
         if description is not None:
             params.append(description)
             set_parts.append(f"description = ${len(params)}")
@@ -679,7 +686,7 @@ async def update_find(
             UPDATE finds SET {', '.join(set_parts)}
                         WHERE id = ${len(params) - 1}::uuid
                             AND user_id = ${len(params)}::uuid
-            RETURNING id, user_id, date, description, cluster_hash,
+            RETURNING id, user_id, date, title, description, cluster_hash,
                       latitude, longitude, category_paths, period,
                       top_category_slug, find_item_id
         """

@@ -44,6 +44,7 @@ def test_build_find_record_includes_location_only_when_requested():
         "id": "a",
         "user_id": "u1",
         "date": datetime(2026, 1, 1),
+        "title": "Test title",
         "description": "desc",
         "cluster_hash": "48.14_17.11",
         "category_paths": [["nature", "forest"]],
@@ -75,6 +76,7 @@ def test_build_find_record_includes_location_only_when_requested():
 
     assert "location" in with_location
     assert with_location["location"]["latitude"] == 48.14
+    assert with_location["title"] == "Test title"
     assert with_location["tagItemIds"] == ["00000000-0000-0000-0000-000000000123"]
     assert "location" not in without_location
 

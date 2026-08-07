@@ -127,6 +127,7 @@ class PublicFindRecord(BaseModel):
     displayNickname: Optional[str] = None
     date: datetime
     categoryPaths: List[List[str]]
+    title: Optional[str] = None
     description: str
     clusterHash: str
     period: Optional[str] = None
@@ -259,6 +260,7 @@ VALID_PERIODS = {
 class CreateFindRequest(BaseModel):
     date: datetime
     categoryPaths: List[List[str]]
+    title: Optional[str] = None
     description: str
     location: LatLng
     clusterHash: str
@@ -277,6 +279,7 @@ class CreateFindRequest(BaseModel):
 class UpdateFindRequest(BaseModel):
     date: Optional[datetime] = None
     categoryPaths: Optional[List[List[str]]] = None
+    title: Optional[str] = None
     description: Optional[str] = None
     location: Optional[LatLng] = None
     itemId: Optional[str] = None
@@ -334,7 +337,7 @@ async def _resolve_tag_item_contexts(
     language_code: str,
     tag_item_ids: List[str],
 ) -> List[Dict[str, Any]]:
-    """Resolve all requested tag items and ensure they stay within one top category."""
+    """Resolve all requested tag items and return their category contexts."""
     contexts: List[Dict[str, Any]] = []
 
     for tag_item_id in tag_item_ids:
@@ -347,13 +350,6 @@ async def _resolve_tag_item_contexts(
         if item_context is None:
             raise HTTPException(status_code=400, detail="Invalid or inaccessible itemId")
         contexts.append(item_context)
-
-    top_category_slugs = {context["topCategorySlug"] for context in contexts}
-    if len(top_category_slugs) > 1:
-        raise HTTPException(
-            status_code=400,
-            detail="All tagged items must belong to the same top category",
-        )
 
     return contexts
 
@@ -906,13 +902,26 @@ async def create_find(
                 tag_item_ids=tag_item_ids,
             )
             primary_item_id = request.itemId or item_contexts[0]["itemId"]
-            derived_category_paths = [context["categoryPath"][0] for context in item_contexts]
-            top_category_slug = item_contexts[0]["topCategorySlug"]
+            derived_category_paths = []
+            seen_category_paths = set()
+            for context in item_contexts:
+                path = context["categoryPath"][0]
+                path_key = "/".join(path)
+                if path_key in seen_category_paths:
+                    continue
+                seen_category_paths.add(path_key)
+                derived_category_paths.append(path)
+
+            top_category_slugs = {
+                context["topCategorySlug"] for context in item_contexts if context.get("topCategorySlug")
+            }
+            top_category_slug = next(iter(top_category_slugs)) if len(top_category_slugs) == 1 else None
 
             result_data = await insert_find(
                 user_id=effective_user_id,
                 app_variant_id=variant["id"],
                 date=request.date,
+                title=request.title,
                 description=request.description,
                 cluster_hash=request.clusterHash,
                 latitude=request.location.latitude,
@@ -931,6 +940,7 @@ async def create_find(
                 userId=effective_user_id,
                 date=request.date,
                 categoryPaths=request.categoryPaths,
+                title=request.title,
                 description=request.description,
                 clusterHash=request.clusterHash,
                 location=request.location,
@@ -1065,15 +1075,27 @@ async def update_find(
                     tag_item_ids=tag_item_ids,
                 )
                 item_context = item_contexts[0]
-                top_category_slug = item_context["topCategorySlug"]
+                top_category_slugs = {
+                    context["topCategorySlug"] for context in item_contexts if context.get("topCategorySlug")
+                }
+                top_category_slug = next(iter(top_category_slugs)) if len(top_category_slugs) == 1 else None
                 find_item_id = request.itemId or item_context["itemId"]
                 if category_paths is None:
-                    category_paths = [context["categoryPath"][0] for context in item_contexts]
+                    category_paths = []
+                    seen_category_paths = set()
+                    for context in item_contexts:
+                        path = context["categoryPath"][0]
+                        path_key = "/".join(path)
+                        if path_key in seen_category_paths:
+                            continue
+                        seen_category_paths.add(path_key)
+                        category_paths.append(path)
 
             result = await db_update_find(
                 find_id=find_id,
                 user_id=current_user.user_id,
                 date=request.date,
+                title=request.title,
                 description=request.description,
                 latitude=request.location.latitude if request.location else None,
                 longitude=request.location.longitude if request.location else None,
@@ -1096,6 +1118,7 @@ async def update_find(
                 k: v for k, v in {
                     "date": request.date,
                     "categoryPaths": request.categoryPaths,
+                    "title": request.title,
                     "description": request.description,
                     "location": request.location,
                     "itemId": request.itemId,
