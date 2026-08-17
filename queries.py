@@ -3,6 +3,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 import json
+import re
 from database import get_db_connection, release_db_connection
 
 
@@ -933,6 +934,218 @@ async def list_category_items(
             }
             for r in rows
         ]
+    finally:
+        await release_db_connection(conn)
+
+
+def _canonicalize_item_title(title: str) -> str:
+    """Normalize item title to a stable canonical key for deduplication."""
+    normalized = re.sub(r"\s+", " ", title.strip().lower())
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
+    normalized = re.sub(r"-+", "-", normalized).strip("-")
+    return normalized
+
+
+async def create_category_item(
+    user_id: str,
+    app_variant_id: str,
+    language_code: str,
+    top_category_slug: str,
+    category_slug: str,
+    title: str,
+    description_text: Optional[str] = None,
+) -> dict:
+    """Create a user-owned category item or return an already-visible canonical match."""
+    normalized_title = title.strip()
+    if len(normalized_title) < 2:
+        raise ValueError("category_item_error_title_too_short")
+
+    canonical_key = _canonicalize_item_title(normalized_title)
+    if not canonical_key:
+        raise ValueError("category_item_error_title_invalid")
+
+    normalized_description = description_text.strip() if isinstance(description_text, str) else None
+
+    conn = await get_db_connection()
+    try:
+        existing = await conn.fetchrow(
+            """
+            WITH target_category AS (
+                SELECT c.id AS category_id
+                FROM categories c
+                LEFT JOIN categories p ON p.id = c.parent_category_id
+                WHERE c.app_variant_id = $1::uuid
+                  AND c.slug = $2
+                  AND COALESCE(p.slug, c.slug) = $3
+                LIMIT 1
+            )
+            SELECT ci.id,
+                   ci.category_id,
+                   c.slug AS category_slug,
+                   COALESCE(p.slug, c.slug) AS top_category_slug,
+                   COALESCE(ct_top.label, COALESCE(p.slug, c.slug)) AS top_category_label,
+                   ci.canonical_key,
+                   COALESCE(cit.title, ci.canonical_key, c.slug) AS title,
+                   cit.description_text,
+                   ci.image_url,
+                   ci.owner_type,
+                   ci.approval_state,
+                   ci.promoted_to_admin,
+                   ci.created_by_user_id
+            FROM category_items ci
+            JOIN target_category tc ON tc.category_id = ci.category_id
+            JOIN categories c ON c.id = ci.category_id
+            LEFT JOIN categories p ON p.id = c.parent_category_id
+            LEFT JOIN category_item_translations cit
+              ON cit.item_id = ci.id
+             AND cit.language_code = $6
+            LEFT JOIN category_translations ct_top
+              ON ct_top.category_id = COALESCE(p.id, c.id)
+             AND ct_top.language_code = $6
+            WHERE ci.canonical_key = $4
+              AND ci.visibility_state = 'visible'
+              AND (
+                    ci.owner_type = 'admin'
+                 OR ci.approval_state = 'approved'
+                 OR ci.created_by_user_id = $5::uuid
+              )
+            LIMIT 1
+            """,
+            app_variant_id,
+            category_slug,
+            top_category_slug,
+            canonical_key,
+            user_id,
+            language_code,
+        )
+        if existing is not None:
+            return {
+                "id": str(existing["id"]),
+                "categoryId": str(existing["category_id"]),
+                "categorySlug": existing["category_slug"],
+                "topCategorySlug": existing["top_category_slug"],
+                "topCategoryLabel": existing["top_category_label"],
+                "canonicalKey": existing["canonical_key"],
+                "title": existing["title"],
+                "descriptionText": existing["description_text"],
+                "imageUrl": existing["image_url"],
+                "ownerType": existing["owner_type"],
+                "approvalState": existing["approval_state"],
+                "promotedToAdmin": existing["promoted_to_admin"],
+                "createdByUserId": str(existing["created_by_user_id"]),
+            }
+
+        inserted = await conn.fetchrow(
+            """
+            WITH target_category AS (
+                SELECT c.id AS category_id
+                FROM categories c
+                LEFT JOIN categories p ON p.id = c.parent_category_id
+                WHERE c.app_variant_id = $1::uuid
+                  AND c.slug = $2
+                  AND COALESCE(p.slug, c.slug) = $3
+                LIMIT 1
+            )
+            INSERT INTO category_items (
+                app_variant_id,
+                category_id,
+                canonical_key,
+                created_by_user_id,
+                owner_type,
+                visibility_state,
+                approval_state
+            )
+            SELECT
+                $1::uuid,
+                tc.category_id,
+                $4,
+                $5::uuid,
+                'user',
+                'visible',
+                'none'
+            FROM target_category tc
+            RETURNING id, category_id
+            """,
+            app_variant_id,
+            category_slug,
+            top_category_slug,
+            canonical_key,
+            user_id,
+        )
+
+        if inserted is None:
+            raise ValueError("category_item_error_invalid_category")
+
+        await conn.execute(
+            """
+            INSERT INTO category_item_translations (item_id, language_code, title, description_text)
+            VALUES ($1::uuid, $2, $3, $4)
+            ON CONFLICT (item_id, language_code)
+            DO UPDATE SET
+                title = EXCLUDED.title,
+                description_text = EXCLUDED.description_text
+            """,
+            inserted["id"],
+            language_code,
+            normalized_title,
+            normalized_description,
+        )
+
+        row = await conn.fetchrow(
+            """
+            SELECT ci.id,
+                   ci.category_id,
+                   c.slug AS category_slug,
+                   COALESCE(p.slug, c.slug) AS top_category_slug,
+                   COALESCE(ct_top.label, COALESCE(p.slug, c.slug)) AS top_category_label,
+                   ci.canonical_key,
+                   COALESCE(cit.title, ci.canonical_key, c.slug) AS title,
+                   cit.description_text,
+                   ci.image_url,
+                   ci.owner_type,
+                   ci.approval_state,
+                   ci.promoted_to_admin,
+                   ci.created_by_user_id
+            FROM category_items ci
+            JOIN categories c ON c.id = ci.category_id
+            LEFT JOIN categories p ON p.id = c.parent_category_id
+            LEFT JOIN category_item_translations cit
+              ON cit.item_id = ci.id
+             AND cit.language_code = $2
+            LEFT JOIN category_translations ct_top
+              ON ct_top.category_id = COALESCE(p.id, c.id)
+             AND ct_top.language_code = $2
+            WHERE ci.id = $1::uuid
+            LIMIT 1
+            """,
+            inserted["id"],
+            language_code,
+        )
+
+        if row is None:
+            raise ValueError("category_item_error_invalid_category")
+
+        return {
+            "id": str(row["id"]),
+            "categoryId": str(row["category_id"]),
+            "categorySlug": row["category_slug"],
+            "topCategorySlug": row["top_category_slug"],
+            "topCategoryLabel": row["top_category_label"],
+            "canonicalKey": row["canonical_key"],
+            "title": row["title"],
+            "descriptionText": row["description_text"],
+            "imageUrl": row["image_url"],
+            "ownerType": row["owner_type"],
+            "approvalState": row["approval_state"],
+            "promotedToAdmin": row["promoted_to_admin"],
+            "createdByUserId": str(row["created_by_user_id"]),
+        }
+    except ValueError:
+        raise
+    except Exception as e:
+        if "ux_category_items_category_canonical_key" in str(e):
+            raise ValueError("category_item_error_duplicate_inaccessible")
+        raise
     finally:
         await release_db_connection(conn)
 

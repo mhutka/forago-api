@@ -35,6 +35,7 @@ from queries import (
     get_user_active_variant,
     list_top_categories,
     list_category_items,
+    create_category_item,
     resolve_item_context,
     update_user_profile,
 )
@@ -248,6 +249,47 @@ class CategoryItemResponse(BaseModel):
     approvalState: str
     promotedToAdmin: bool
     createdByUserId: str
+
+
+class CreateCategoryItemRequest(BaseModel):
+    topCategorySlug: str
+    categorySlug: Optional[str] = None
+    title: str
+    descriptionText: Optional[str] = None
+
+    @field_validator("topCategorySlug")
+    @classmethod
+    def validate_top_category_slug(cls, v: str) -> str:
+        value = v.strip().lower()
+        if len(value) < 2:
+            raise ValueError("topCategorySlug must be at least 2 characters")
+        return value
+
+    @field_validator("categorySlug")
+    @classmethod
+    def validate_category_slug(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        value = v.strip().lower()
+        return value or None
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, v: str) -> str:
+        value = v.strip()
+        if len(value) < 2:
+            raise ValueError("title must be at least 2 characters")
+        if len(value) > 80:
+            raise ValueError("title must be at most 80 characters")
+        return value
+
+    @field_validator("descriptionText")
+    @classmethod
+    def validate_description_text(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = v.strip()
+        return value or None
 
 VALID_PERIODS = {
     "JAN_1", "JAN_2", "FEB_1", "FEB_2", "MAR_1", "MAR_2",
@@ -712,6 +754,42 @@ async def get_category_items(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load category items: {str(e)}")
+
+
+@app.post("/api/category-items", response_model=CategoryItemResponse, status_code=status.HTTP_201_CREATED)
+async def post_category_item(
+    request: CreateCategoryItemRequest,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Create user-owned category item for active variant and return normalized item payload."""
+    try:
+        if settings.data_source_mode != "db":
+            raise HTTPException(status_code=501, detail="category_item_error_create_unavailable_mock")
+
+        variant = await get_user_active_variant(current_user.user_id)
+        if variant is None:
+            raise HTTPException(status_code=404, detail="No active variant found for user")
+
+        profile = await get_user_profile(current_user.user_id)
+        language_code = (profile or {}).get("languageCode") or variant["defaultLanguageCode"]
+        category_slug = request.categorySlug or request.topCategorySlug
+
+        row = await create_category_item(
+            user_id=current_user.user_id,
+            app_variant_id=variant["id"],
+            language_code=language_code,
+            top_category_slug=request.topCategorySlug,
+            category_slug=category_slug,
+            title=request.title,
+            description_text=request.descriptionText,
+        )
+        return CategoryItemResponse(**row)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create category item: {str(e)}")
 
 # ---------- FINDS ENDPOINTS ----------
 
