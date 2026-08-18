@@ -4,7 +4,19 @@ from unittest.mock import AsyncMock
 import pytest
 
 import queries
-from queries import _apply_find_filters, _build_find_record
+from queries import _apply_find_filters, _build_find_record, _period_for_date
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (datetime(2026, 1, 15), "JAN_1"),
+        (datetime(2026, 1, 16), "JAN_2"),
+        (datetime(2026, 12, 31), "DEC_2"),
+    ],
+)
+def test_period_for_date_uses_half_month_boundaries(value, expected):
+    assert _period_for_date(value) == expected
 
 
 def test_apply_find_filters_builds_expected_sql_and_params():
@@ -19,6 +31,7 @@ def test_apply_find_filters_builds_expected_sql_and_params():
         from_date=datetime(2026, 1, 1),
         to_date=datetime(2026, 2, 1),
         period="JAN_2",
+        periods=["JAN_2", "FEB_1"],
         top_category_slug="mushrooms",
         item_id="00000000-0000-0000-0000-000000000123",
         tag_item_ids=["00000000-0000-0000-0000-000000000124"],
@@ -28,12 +41,12 @@ def test_apply_find_filters_builds_expected_sql_and_params():
     assert "date >= $2" in query
     assert "date <= $3" in query
     assert "category_paths @> $4::jsonb[]" in query
-    assert "period = $5" in query
+    assert "period = ANY($5::varchar[])" in query
     assert "top_category_slug = $6" in query
     assert "find_item_id = $7::uuid" in query
     assert "find_item_id = ANY($8::uuid[])" in query
     assert out_params[0] == "48.14_17.11"
-    assert out_params[4] == "JAN_2"
+    assert out_params[4] == ["JAN_2", "FEB_1"]
     assert out_params[5] == "mushrooms"
     assert out_params[6] == "00000000-0000-0000-0000-000000000123"
     assert out_params[7] == ["00000000-0000-0000-0000-000000000124"]

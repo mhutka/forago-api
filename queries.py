@@ -13,6 +13,15 @@ def _decode_jsonb(value: Any) -> List[Any]:
         return json.loads(value)
     return value if value is not None else []
 
+
+def _period_for_date(value: datetime) -> str:
+    """Return the persisted half-month period code for a find date."""
+    month_codes = (
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    )
+    return f"{month_codes[value.month - 1]}_{1 if value.day <= 15 else 2}"
+
 # These models are imported from main.py to avoid circular imports
 # We'll use them in responses
 
@@ -116,6 +125,7 @@ def _apply_find_filters(
     from_date: Optional[datetime],
     to_date: Optional[datetime],
     period: Optional[str],
+    periods: Optional[List[str]],
     top_category_slug: Optional[str],
     item_id: Optional[str],
     tag_item_ids: Optional[List[str]] = None,
@@ -139,9 +149,12 @@ def _apply_find_filters(
             query += f" AND category_paths @> ${len(params) + 1}::jsonb[]"
             params.append(json.dumps([segments]))
 
-    if period:
-        query += f" AND period = ${len(params) + 1}"
-        params.append(period)
+    effective_periods = list(dict.fromkeys(
+        ([period] if period else []) + list(periods or [])
+    ))
+    if effective_periods:
+        query += f" AND period = ANY(${len(params) + 1}::varchar[])"
+        params.append(effective_periods)
 
     if top_category_slug:
         query += f" AND top_category_slug = ${len(params) + 1}"
@@ -208,6 +221,7 @@ async def query_public_finds(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
+    periods: Optional[List[str]] = None,
     top_category_slug: Optional[str] = None,
     item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
@@ -231,6 +245,7 @@ async def query_public_finds(
             from_date=from_date,
             to_date=to_date,
             period=period,
+            periods=periods,
             top_category_slug=top_category_slug,
             item_id=item_id,
             tag_item_ids=tag_item_ids,
@@ -273,6 +288,7 @@ async def query_private_finds(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
+    periods: Optional[List[str]] = None,
     top_category_slug: Optional[str] = None,
     item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
@@ -297,6 +313,7 @@ async def query_private_finds(
             from_date=from_date,
             to_date=to_date,
             period=period,
+            periods=periods,
             top_category_slug=top_category_slug,
             item_id=item_id,
             tag_item_ids=tag_item_ids,
@@ -338,6 +355,7 @@ async def query_finds_nearby(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
+    periods: Optional[List[str]] = None,
     top_category_slug: Optional[str] = None,
     item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
@@ -351,6 +369,7 @@ async def query_finds_nearby(
         from_date=from_date,
         to_date=to_date,
         period=period,
+        periods=periods,
         top_category_slug=top_category_slug,
         item_id=item_id,
         tag_item_ids=tag_item_ids,
@@ -373,6 +392,7 @@ async def insert_find(
     tag_item_ids: Optional[List[str]] = None,
 ) -> dict:
     """Insert a new find record into database and return API payload."""
+    derived_period = _period_for_date(date)
     conn = await get_db_connection()
     try:
         query = """
@@ -398,7 +418,7 @@ async def insert_find(
             latitude,
             longitude,
             json.dumps(category_paths),
-            period,
+            derived_period,
             top_category_slug,
             find_item_id,
         )
@@ -651,6 +671,8 @@ async def update_find(
         if date is not None:
             params.append(date)
             set_parts.append(f"date = ${len(params)}")
+            params.append(_period_for_date(date))
+            set_parts.append(f"period = ${len(params)}")
         if title is not None:
             params.append(title)
             set_parts.append(f"title = ${len(params)}")
@@ -666,7 +688,7 @@ async def update_find(
         if category_paths is not None:
             params.append(json.dumps(category_paths))
             set_parts.append(f"category_paths = ${len(params)}")
-        if period is not None:
+        if period is not None and date is None:
             params.append(period)
             set_parts.append(f"period = ${len(params)}")
         if top_category_slug is not None:

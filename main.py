@@ -501,10 +501,27 @@ def _matches_date_filter(
     return True
 
 
-def _matches_period_filter(record: PublicFindRecord, period: Optional[str]) -> bool:
-    if not period:
+def _matches_period_filter(
+    record: PublicFindRecord,
+    period: Optional[str],
+    periods: Optional[List[str]] = None,
+) -> bool:
+    effective_periods = set(([period] if period else []) + list(periods or []))
+    if not effective_periods:
         return True
-    return record.period == period
+    return record.period in effective_periods
+
+
+def _validate_filter_periods(period: Optional[str], periods: Optional[List[str]]) -> None:
+    invalid_periods = {
+        value for value in ([period] if period else []) + list(periods or [])
+        if value not in VALID_PERIODS
+    }
+    if invalid_periods:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid period filter: {sorted(invalid_periods)}",
+        )
 
 
 # ============ ROUTES ============
@@ -803,12 +820,14 @@ async def get_public_finds(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
+    periods: Optional[List[str]] = None,
 ):
     """
     Get all public finds (visible to all users)
     Filter by cluster, category, date range, period
     """
     try:
+        _validate_filter_periods(period, periods)
         if settings.data_source_mode == "db":
             results_data = await query_public_finds(
                 cluster=cluster,
@@ -819,6 +838,7 @@ async def get_public_finds(
                 from_date=from_date,
                 to_date=to_date,
                 period=period,
+                periods=periods,
             )
             return [PublicFindRecord(**r) for r in results_data]
         else:
@@ -834,8 +854,8 @@ async def get_public_finds(
             if from_date or to_date:
                 results = [f for f in results if _matches_date_filter(f, from_date, to_date)]
 
-            if period:
-                results = [f for f in results if _matches_period_filter(f, period)]
+            if period or periods:
+                results = [f for f in results if _matches_period_filter(f, period, periods)]
 
             return results
     except Exception as e:
@@ -854,9 +874,11 @@ async def get_finds_nearby(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
+    periods: Optional[List[str]] = None,
 ):
     """Get finds near a specific cluster"""
     try:
+        _validate_filter_periods(period, periods)
         if settings.data_source_mode == "db":
             results_data = await query_finds_nearby(
                 cluster=cluster,
@@ -867,6 +889,7 @@ async def get_finds_nearby(
                 from_date=from_date,
                 to_date=to_date,
                 period=period,
+                periods=periods,
             )
             return [PublicFindRecord(**r) for r in results_data]
         else:
@@ -883,8 +906,8 @@ async def get_finds_nearby(
             if from_date or to_date:
                 results = [f for f in results if _matches_date_filter(f, from_date, to_date)]
 
-            if period:
-                results = [f for f in results if _matches_period_filter(f, period)]
+            if period or periods:
+                results = [f for f in results if _matches_period_filter(f, period, periods)]
 
             return results
     except Exception as e:
@@ -903,6 +926,7 @@ async def get_private_finds(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
+    periods: Optional[List[str]] = None,
     current_user: AuthUser = Depends(get_current_user),
 ):
     """
@@ -910,6 +934,7 @@ async def get_private_finds(
     Requires authentication
     """
     try:
+        _validate_filter_periods(period, periods)
         effective_user_id = current_user.user_id
 
         if settings.data_source_mode == "db":
@@ -923,6 +948,7 @@ async def get_private_finds(
                 from_date=from_date,
                 to_date=to_date,
                 period=period,
+                periods=periods,
             )
             return [PrivateFindRecord(**r) for r in results_data]
         else:
@@ -940,8 +966,8 @@ async def get_private_finds(
             if from_date or to_date:
                 results = [f for f in results if _matches_date_filter(f, from_date, to_date)]
 
-            if period:
-                results = [f for f in results if _matches_period_filter(f, period)]
+            if period or periods:
+                results = [f for f in results if _matches_period_filter(f, period, periods)]
 
             return results
     except Exception as e:
