@@ -157,7 +157,16 @@ def _apply_find_filters(
         params.append(effective_periods)
 
     if top_category_slug:
-        query += f" AND top_category_slug = ${len(params) + 1}"
+        # A find can carry category_paths spanning multiple top categories, but the
+        # denormalized top_category_slug column only stores a single value (or NULL
+        # when ambiguous at write time). Match either the column or any path segment
+        # so finds tagged with more than one top category are still found by each.
+        idx = len(params) + 1
+        query += (
+            f" AND (top_category_slug = ${idx}"
+            f" OR EXISTS (SELECT 1 FROM jsonb_array_elements(category_paths) AS cp"
+            f" WHERE cp ->> 0 = ${idx}))"
+        )
         params.append(top_category_slug)
 
     if item_id:
