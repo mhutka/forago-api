@@ -12,6 +12,8 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, ExpiredSignatureError, jwt
 
+from config import settings
+
 
 bearer_scheme = HTTPBearer(auto_error=False)
 _JWKS_CACHE: Dict[str, Any] = {"url": None, "expires_at": 0.0, "keys": []}
@@ -31,17 +33,17 @@ def _parse_algorithms(raw: str) -> List[str]:
 
 def _jwt_secret() -> str:
     # Support both new and legacy env naming.
-    secret = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY", "")
+    secret = settings.jwt_secret_key or os.getenv("SECRET_KEY", "")
     return secret
 
 
 def _jwt_public_key() -> str:
-    raw_key = os.getenv("JWT_PUBLIC_KEY", "").strip()
+    raw_key = (settings.jwt_public_key or "").strip()
     if raw_key:
         # Keep escaped newlines usable for .env style values.
         return raw_key.replace("\\n", "\n")
 
-    key_file = os.getenv("JWT_PUBLIC_KEY_FILE", "").strip()
+    key_file = (settings.jwt_public_key_file or "").strip()
     if key_file:
         with open(key_file, "r", encoding="utf-8") as f:
             return f.read()
@@ -49,46 +51,46 @@ def _jwt_public_key() -> str:
 
 
 def _jwt_issuer() -> Optional[str]:
-    configured = os.getenv("JWT_ISSUER")
+    configured = settings.jwt_issuer
     if configured:
         return configured
 
-    supabase_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    supabase_url = (settings.supabase_url or "").strip().rstrip("/")
     if supabase_url:
         return f"{supabase_url}/auth/v1"
     return None
 
 
 def _jwt_audience() -> Optional[str]:
-    configured = os.getenv("JWT_AUDIENCE")
+    configured = settings.jwt_audience
     if configured:
         return configured
 
-    supabase_url = os.getenv("SUPABASE_URL", "").strip()
+    supabase_url = (settings.supabase_url or "").strip()
     if supabase_url:
-        return os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
+        return settings.supabase_jwt_audience
     return None
 
 
 def _jwt_algorithms() -> List[str]:
-    configured = os.getenv("JWT_ALGORITHMS") or os.getenv("JWT_ALGORITHM")
+    configured = settings.jwt_algorithms or os.getenv("JWT_ALGORITHM")
     if configured and configured.strip():
         return _parse_algorithms(configured)
 
     # Supabase access tokens are typically RS256, but can also be ES256
     # depending on project signing key configuration.
-    if os.getenv("SUPABASE_URL", "").strip():
+    if (settings.supabase_url or "").strip():
         return ["RS256", "ES256"]
 
     return ["HS256"]
 
 
 def _jwt_jwks_url() -> str:
-    configured = os.getenv("JWT_JWKS_URL", "").strip()
+    configured = (settings.jwt_jwks_url or "").strip()
     if configured:
         return configured
 
-    supabase_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    supabase_url = (settings.supabase_url or "").strip().rstrip("/")
     if supabase_url:
         return f"{supabase_url}/auth/v1/.well-known/jwks.json"
     return ""
