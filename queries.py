@@ -487,6 +487,43 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
         await release_db_connection(conn)
 
 
+async def insert_find_comment(
+    find_id: str,
+    user_id: str,
+    text: str,
+) -> Optional[dict]:
+    """Insert a comment only when its find is publicly visible."""
+    conn = await get_db_connection()
+    try:
+        find_exists = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM finds WHERE id = $1::uuid AND allow_public = TRUE)",
+            find_id,
+        )
+        if not find_exists:
+            return None
+
+        row = await conn.fetchrow(
+            """
+            INSERT INTO find_comments (find_id, user_id, text)
+            VALUES ($1::uuid, $2::uuid, $3)
+            RETURNING id, user_id, text, created_at
+            """,
+            find_id,
+            user_id,
+            text,
+        )
+        nicknames = await _fetch_display_nicknames(conn, [row["user_id"]])
+        return {
+            "id": str(row["id"]),
+            "userId": str(row["user_id"]),
+            "displayNickname": nicknames.get(str(row["user_id"])),
+            "text": row["text"],
+            "createdAt": row["created_at"],
+        }
+    finally:
+        await release_db_connection(conn)
+
+
 async def get_user_profile(user_id: str) -> Optional[dict]:
     """Fetch profile data for a user including earned badge codes."""
     conn = await get_db_connection()

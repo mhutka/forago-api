@@ -38,6 +38,7 @@ from queries import (
     create_category_item,
     resolve_item_context,
     update_user_profile,
+    insert_find_comment,
 )
 
 # ============ LOGGING SETUP ============
@@ -121,6 +122,20 @@ class RecordComment(BaseModel):
     displayNickname: Optional[str] = None
     text: str
     createdAt: datetime
+
+
+class CreateCommentRequest(BaseModel):
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Comment text must not be empty")
+        if len(normalized) > 1000:
+            raise ValueError("Comment text must be at most 1000 characters")
+        return normalized
 
 class PublicFindRecord(BaseModel):
     id: str
@@ -1080,6 +1095,40 @@ async def get_find(find_id: str, current_user: AuthUser = Depends(get_current_us
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
+
+
+@app.post(
+    "/api/finds/{find_id}/comments",
+    response_model=RecordComment,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_find_comment(
+    find_id: str,
+    request: CreateCommentRequest,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Add a comment to a publicly visible find."""
+    try:
+        if settings.data_source_mode != "db":
+            raise HTTPException(
+                status_code=501,
+                detail="Comments are only available in db mode",
+            )
+
+        comment = await insert_find_comment(
+            find_id=find_id,
+            user_id=current_user.user_id,
+            text=request.text,
+        )
+        if comment is None:
+            raise HTTPException(status_code=404, detail="Find not found")
+        return RecordComment(**comment)
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Find not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create comment: {str(e)}")
 
 
 @app.post("/api/finds/{find_id}/images/presign", response_model=PresignFindImagesResponse)
