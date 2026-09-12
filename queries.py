@@ -495,23 +495,27 @@ async def insert_find_comment(
     """Insert a comment only when its find is publicly visible."""
     conn = await get_db_connection()
     try:
-        find_exists = await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM finds WHERE id = $1::uuid AND allow_public = TRUE)",
-            find_id,
-        )
-        if not find_exists:
-            return None
-
         row = await conn.fetchrow(
             """
-            INSERT INTO find_comments (find_id, user_id, text)
-            VALUES ($1::uuid, $2::uuid, $3)
+            INSERT INTO find_comments (
+                find_id,
+                user_id,
+                text,
+                language_code,
+                app_variant_id
+            )
+            SELECT $1::uuid, $2::uuid, $3, 'sk', f.app_variant_id
+            FROM finds f
+            WHERE f.id = $1::uuid AND f.allow_public = TRUE
             RETURNING id, user_id, text, created_at
             """,
             find_id,
             user_id,
             text,
         )
+        if row is None:
+            return None
+
         nicknames = await _fetch_display_nicknames(conn, [row["user_id"]])
         return {
             "id": str(row["id"]),

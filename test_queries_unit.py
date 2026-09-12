@@ -117,3 +117,41 @@ async def test_ensure_user_profile_releases_connection(monkeypatch):
     conn.execute.assert_awaited_once()
     released.assert_awaited_once_with(conn)
     conn.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_insert_find_comment_populates_required_metadata(monkeypatch):
+    conn = AsyncMock()
+    conn.fetchrow.return_value = {
+        "id": "comment-1",
+        "user_id": "00000000-0000-0000-0000-000000000777",
+        "text": "Test comment",
+        "created_at": datetime(2026, 9, 12),
+    }
+    released = AsyncMock()
+
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    monkeypatch.setattr(queries, "release_db_connection", released)
+    monkeypatch.setattr(
+        queries,
+        "_fetch_display_nicknames",
+        AsyncMock(return_value={"00000000-0000-0000-0000-000000000777": "tester"}),
+    )
+
+    comment = await queries.insert_find_comment(
+        find_id="00000000-0000-0000-0000-000000000888",
+        user_id="00000000-0000-0000-0000-000000000777",
+        text="Test comment",
+    )
+
+    query, *params = conn.fetchrow.await_args.args
+    assert "language_code" in query
+    assert "app_variant_id" in query
+    assert "SELECT $1::uuid, $2::uuid, $3, 'sk', f.app_variant_id" in query
+    assert params == [
+        "00000000-0000-0000-0000-000000000888",
+        "00000000-0000-0000-0000-000000000777",
+        "Test comment",
+    ]
+    assert comment["displayNickname"] == "tester"
+    released.assert_awaited_once_with(conn)
