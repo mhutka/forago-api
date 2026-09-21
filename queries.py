@@ -2,16 +2,8 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
-import json
 import re
 from database import get_db_connection, release_db_connection
-
-
-def _decode_jsonb(value: Any) -> List[Any]:
-    """asyncpg may return JSONB columns as a raw JSON string; decode if needed."""
-    if isinstance(value, str):
-        return json.loads(value)
-    return value if value is not None else []
 
 
 def _period_for_date(value: datetime) -> str:
@@ -105,6 +97,45 @@ async def _replace_find_tag_items(conn: Any, find_id: Any, tag_item_ids: List[st
     )
 
 
+async def _fetch_find_category_slugs(conn: Any, find_uuids: List[Any]) -> Dict[str, List[str]]:
+    """Batch-fetch top-level category slugs for a list of finds."""
+    if not find_uuids:
+        return {}
+
+    rows = await conn.fetch(
+        "SELECT fc.find_id, c.slug "
+        "FROM find_categories fc "
+        "JOIN categories c ON c.id = fc.category_id "
+        "WHERE fc.find_id = ANY($1::uuid[]) "
+        "ORDER BY c.sort_order ASC, c.slug ASC",
+        find_uuids,
+    )
+
+    category_slugs_by_find_id: Dict[str, List[str]] = {}
+    for row in rows:
+        fid = str(row["find_id"])
+        category_slugs_by_find_id.setdefault(fid, []).append(row["slug"])
+
+    return category_slugs_by_find_id
+
+
+async def _replace_find_categories(conn: Any, find_id: Any, category_ids: List[str]) -> None:
+    """Replace category membership rows for one find."""
+    await conn.execute("DELETE FROM find_categories WHERE find_id = $1::uuid", find_id)
+
+    if not category_ids:
+        return
+
+    await conn.executemany(
+        """
+        INSERT INTO find_categories (find_id, category_id)
+        VALUES ($1::uuid, $2::uuid)
+        ON CONFLICT (find_id, category_id) DO NOTHING
+        """,
+        [(find_id, category_id) for category_id in category_ids],
+    )
+
+
 async def _fetch_display_nicknames(conn: Any, user_ids: List[Any]) -> Dict[str, str]:
     """Fetch display nicknames for a set of user UUIDs."""
     if not user_ids:
@@ -146,8 +177,13 @@ def _apply_find_filters(
     if category:
         segments = [seg for seg in category.split("/") if seg]
         if segments:
-            query += f" AND category_paths @> ${len(params) + 1}::jsonb[]"
-            params.append(json.dumps([segments]))
+            idx = len(params) + 1
+            query += (
+                f" AND EXISTS (SELECT 1 FROM find_categories fc "
+                f"JOIN categories c ON c.id = fc.category_id "
+                f"WHERE fc.find_id = finds.id AND c.slug = ${idx})"
+            )
+            params.append(segments[0])
 
     effective_periods = list(dict.fromkeys(
         ([period] if period else []) + list(periods or [])
@@ -157,15 +193,11 @@ def _apply_find_filters(
         params.append(effective_periods)
 
     if top_category_slug:
-        # A find can carry category_paths spanning multiple top categories, but the
-        # denormalized top_category_slug column only stores a single value (or NULL
-        # when ambiguous at write time). Match either the column or any path segment
-        # so finds tagged with more than one top category are still found by each.
         idx = len(params) + 1
         query += (
-            f" AND (top_category_slug = ${idx}"
-            f" OR EXISTS (SELECT 1 FROM jsonb_array_elements(category_paths) AS cp"
-            f" WHERE cp ->> 0 = ${idx}))"
+            f" AND EXISTS (SELECT 1 FROM find_categories fc "
+            f"JOIN categories c ON c.id = fc.category_id "
+            f"WHERE fc.find_id = finds.id AND c.slug = ${idx})"
         )
         params.append(top_category_slug)
 
@@ -195,9 +227,11 @@ def _build_find_record(
     images_by_id: Dict[str, list],
     comments_by_id: Dict[str, list],
     tag_item_ids_by_find_id: Dict[str, List[str]],
+    category_slugs_by_find_id: Dict[str, List[str]],
     include_location: bool,
 ) -> Dict[str, Any]:
     """Build API record payload from a DB row."""
+    category_slugs = category_slugs_by_find_id.get(fid, [])
     payload: Dict[str, Any] = {
         "id": fid,
         "userId": str(row["user_id"]),
@@ -206,9 +240,9 @@ def _build_find_record(
         "title": row.get("title") if hasattr(row, "get") else row["title"],
         "description": row["description"],
         "clusterHash": row["cluster_hash"],
-        "categoryPaths": _decode_jsonb(row["category_paths"]),
+        "categoryPaths": [[slug] for slug in category_slugs],
         "period": row["period"],
-        "topCategorySlug": row.get("top_category_slug") if hasattr(row, "get") else row["top_category_slug"],
+        "topCategorySlug": category_slugs[0] if len(category_slugs) == 1 else None,
         "itemId": str(row["find_item_id"]) if row.get("find_item_id") is not None else None,
         "tagItemIds": tag_item_ids_by_find_id.get(fid, []),
         "images": images_by_id.get(fid, []),
@@ -241,7 +275,7 @@ async def query_public_finds(
         query = """
             SELECT 
                 id, user_id, date, title, description, cluster_hash,
-                category_paths, period, top_category_slug, find_item_id, created_at
+                period, find_item_id, created_at
             FROM finds
             WHERE allow_public = TRUE
         """
@@ -268,6 +302,7 @@ async def query_public_finds(
         owner_ids = [row["user_id"] for row in rows]
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
+        category_slugs_by_find_id = await _fetch_find_category_slugs(conn, find_uuids)
         nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
 
         results = []
@@ -281,6 +316,7 @@ async def query_public_finds(
                     images_by_id=images_by_id,
                     comments_by_id=comments_by_id,
                     tag_item_ids_by_find_id=tag_item_ids_by_find_id,
+                    category_slugs_by_find_id=category_slugs_by_find_id,
                     include_location=False,
                 )
             )
@@ -308,8 +344,8 @@ async def query_private_finds(
         query = """
             SELECT 
                 id, user_id, date, title, description, cluster_hash,
-                latitude, longitude, category_paths, period,
-                top_category_slug, find_item_id, created_at
+                latitude, longitude, period,
+                find_item_id, created_at
             FROM finds
             WHERE user_id = $1
         """
@@ -336,6 +372,7 @@ async def query_private_finds(
         owner_ids = [row["user_id"] for row in rows]
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
+        category_slugs_by_find_id = await _fetch_find_category_slugs(conn, find_uuids)
         nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
 
         results = []
@@ -349,6 +386,7 @@ async def query_private_finds(
                     images_by_id=images_by_id,
                     comments_by_id=comments_by_id,
                     tag_item_ids_by_find_id=tag_item_ids_by_find_id,
+                    category_slugs_by_find_id=category_slugs_by_find_id,
                     include_location=True,
                 )
             )
@@ -394,9 +432,8 @@ async def insert_find(
     cluster_hash: str,
     latitude: float,
     longitude: float,
-    category_paths: List[List[str]],
+    category_ids: Optional[List[str]] = None,
     period: Optional[str] = None,
-    top_category_slug: Optional[str] = None,
     find_item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
 ) -> dict:
@@ -407,13 +444,11 @@ async def insert_find(
         query = """
             INSERT INTO finds (
                 user_id, app_variant_id, date, title, description, cluster_hash,
-                latitude, longitude, category_paths, period,
-                top_category_slug, find_item_id
+                latitude, longitude, period, find_item_id
             )
-            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::uuid)
+            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::uuid)
             RETURNING id, user_id, date, title, description, cluster_hash,
-                      latitude, longitude, category_paths, period,
-                      top_category_slug, find_item_id, created_at
+                      latitude, longitude, period, find_item_id, created_at
         """
 
         row = await conn.fetchrow(
@@ -426,19 +461,19 @@ async def insert_find(
             cluster_hash,
             latitude,
             longitude,
-            json.dumps(category_paths),
             derived_period,
-            top_category_slug,
             find_item_id,
         )
 
         effective_tag_item_ids = tag_item_ids or ([find_item_id] if find_item_id else [])
         if effective_tag_item_ids:
             await _replace_find_tag_items(conn, row["id"], effective_tag_item_ids)
+        await _replace_find_categories(conn, row["id"], category_ids or [])
 
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
+        category_slugs_by_find_id = await _fetch_find_category_slugs(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
         return _build_find_record(
             row=row,
@@ -447,6 +482,7 @@ async def insert_find(
             images_by_id=images_by_id,
             comments_by_id=comments_by_id,
             tag_item_ids_by_find_id=tag_item_ids_by_find_id,
+            category_slugs_by_find_id=category_slugs_by_find_id,
             include_location=True,
         )
     finally:
@@ -460,8 +496,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
         row = await conn.fetchrow(
             """
             SELECT id, user_id, date, title, description, cluster_hash,
-                     latitude, longitude, category_paths, period,
-                     top_category_slug, find_item_id
+                     latitude, longitude, period, find_item_id
             FROM finds WHERE id = $1::uuid AND user_id = $2::uuid
             """,
             find_id,
@@ -473,6 +508,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
+        category_slugs_by_find_id = await _fetch_find_category_slugs(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
         return _build_find_record(
             row=row,
@@ -481,6 +517,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
             images_by_id=images_by_id,
             comments_by_id=comments_by_id,
             tag_item_ids_by_find_id=tag_item_ids_by_find_id,
+            category_slugs_by_find_id=category_slugs_by_find_id,
             include_location=True,
         )
     finally:
@@ -706,9 +743,8 @@ async def update_find(
     description: Optional[str] = None,
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
-    category_paths: Optional[List[List[str]]] = None,
+    category_ids: Optional[List[str]] = None,
     period: Optional[str] = None,
-    top_category_slug: Optional[str] = None,
     find_item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
 ) -> Optional[dict]:
@@ -735,15 +771,9 @@ async def update_find(
         if longitude is not None:
             params.append(longitude)
             set_parts.append(f"longitude = ${len(params)}")
-        if category_paths is not None:
-            params.append(json.dumps(category_paths))
-            set_parts.append(f"category_paths = ${len(params)}")
         if period is not None and date is None:
             params.append(period)
             set_parts.append(f"period = ${len(params)}")
-        if top_category_slug is not None:
-            params.append(top_category_slug)
-            set_parts.append(f"top_category_slug = ${len(params)}")
         if find_item_id is not None:
             params.append(find_item_id)
             set_parts.append(f"find_item_id = ${len(params)}::uuid")
@@ -760,8 +790,7 @@ async def update_find(
                         WHERE id = ${len(params) - 1}::uuid
                             AND user_id = ${len(params)}::uuid
             RETURNING id, user_id, date, title, description, cluster_hash,
-                      latitude, longitude, category_paths, period,
-                      top_category_slug, find_item_id
+                      latitude, longitude, period, find_item_id
         """
 
         row = await conn.fetchrow(query, *params)
@@ -770,10 +799,13 @@ async def update_find(
 
         if tag_item_ids is not None:
             await _replace_find_tag_items(conn, row["id"], tag_item_ids)
+        if category_ids is not None:
+            await _replace_find_categories(conn, row["id"], category_ids)
 
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
+        category_slugs_by_find_id = await _fetch_find_category_slugs(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
         return _build_find_record(
             row=row,
@@ -782,6 +814,7 @@ async def update_find(
             images_by_id=images_by_id,
             comments_by_id=comments_by_id,
             tag_item_ids_by_find_id=tag_item_ids_by_find_id,
+            category_slugs_by_find_id=category_slugs_by_find_id,
             include_location=True,
         )
     finally:
@@ -796,64 +829,6 @@ async def delete_find(find_id: str, user_id: str) -> bool:
             "DELETE FROM finds WHERE id = $1::uuid AND user_id = $2::uuid", find_id, user_id
         )
         return result == "DELETE 1"
-    finally:
-        await release_db_connection(conn)
-
-
-async def query_clusters(
-    category: Optional[str] = None,
-    from_date: Optional[datetime] = None,
-    to_date: Optional[datetime] = None,
-) -> List[dict]:
-    """Aggregate public finds into cluster summary records."""
-    conn = await get_db_connection()
-    try:
-        sql = """
-            SELECT
-                cluster_hash,
-                COUNT(*) AS total_records,
-                MAX(updated_at) AS last_updated,
-                jsonb_agg(category_paths) AS all_paths
-            FROM finds
-            WHERE allow_public = TRUE
-        """
-        params: List[Any] = []
-
-        if from_date is not None:
-            params.append(from_date)
-            sql += f" AND date >= ${len(params)}"
-        if to_date is not None:
-            params.append(to_date)
-            sql += f" AND date <= ${len(params)}"
-
-        sql += " GROUP BY cluster_hash ORDER BY cluster_hash"
-
-        rows = await conn.fetch(sql, *params)
-
-        category_segments = [s for s in category.split("/") if s] if category else []
-
-        results = []
-        for row in rows:
-            path_counts: Dict[str, int] = {}
-            for find_paths in (row["all_paths"] or []):
-                if find_paths:
-                    for path in find_paths:
-                        key = "/".join(path)
-                        path_counts[key] = path_counts.get(key, 0) + 1
-
-            if category_segments:
-                prefix = "/".join(category_segments)
-                if not any(k == prefix or k.startswith(prefix + "/") for k in path_counts):
-                    continue
-
-            results.append({
-                "clusterHash": row["cluster_hash"],
-                "categoryPathCounts": path_counts,
-                "totalRecords": row["total_records"],
-                "lastUpdated": row["last_updated"],
-            })
-
-        return results
     finally:
         await release_db_connection(conn)
 
@@ -1237,6 +1212,7 @@ async def resolve_item_context(
                    ci.canonical_key,
                    c.slug AS category_slug,
                    COALESCE(p.slug, c.slug) AS top_category_slug,
+                   COALESCE(p.id, c.id) AS category_id,
                    COALESCE(cit.title, ci.canonical_key, c.slug) AS item_title
             FROM category_items ci
             JOIN categories c ON c.id = ci.category_id
@@ -1267,6 +1243,7 @@ async def resolve_item_context(
             "itemId": str(row["id"]),
             "topCategorySlug": row["top_category_slug"],
             "categorySlug": row["category_slug"],
+            "categoryId": str(row["category_id"]),
             "itemTitle": row["item_title"],
             "categoryPath": [[row["top_category_slug"], row["category_slug"], item_key]],
         }

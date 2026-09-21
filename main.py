@@ -29,7 +29,6 @@ from queries import (
     get_find_by_id,
     update_find as db_update_find,
     delete_find as db_delete_find,
-    query_clusters,
     ensure_user_profile,
     get_user_profile,
     get_user_active_variant,
@@ -155,13 +154,6 @@ class PublicFindRecord(BaseModel):
 
 class PrivateFindRecord(PublicFindRecord):
     location: LatLng
-
-class PublicClusterRecord(BaseModel):
-    clusterHash: str
-    categoryPathCounts: Dict[str, int]
-    totalRecords: int
-    lastUpdated: datetime
-
 
 class AuthMeResponse(BaseModel):
     userId: str
@@ -316,7 +308,7 @@ VALID_PERIODS = {
 
 class CreateFindRequest(BaseModel):
     date: datetime
-    categoryPaths: List[List[str]]
+    categoryPaths: Optional[List[List[str]]] = None
     title: Optional[str] = None
     description: str
     location: LatLng
@@ -1021,20 +1013,7 @@ async def create_find(
                 tag_item_ids=tag_item_ids,
             )
             primary_item_id = request.itemId or item_contexts[0]["itemId"]
-            derived_category_paths = []
-            seen_category_paths = set()
-            for context in item_contexts:
-                path = context["categoryPath"][0]
-                path_key = "/".join(path)
-                if path_key in seen_category_paths:
-                    continue
-                seen_category_paths.add(path_key)
-                derived_category_paths.append(path)
-
-            top_category_slugs = {
-                context["topCategorySlug"] for context in item_contexts if context.get("topCategorySlug")
-            }
-            top_category_slug = next(iter(top_category_slugs)) if len(top_category_slugs) == 1 else None
+            category_ids = list({context["categoryId"] for context in item_contexts})
 
             result_data = await insert_find(
                 user_id=effective_user_id,
@@ -1045,9 +1024,8 @@ async def create_find(
                 cluster_hash=request.clusterHash,
                 latitude=request.location.latitude,
                 longitude=request.location.longitude,
-                category_paths=request.categoryPaths or derived_category_paths,
+                category_ids=category_ids,
                 period=request.period,
-                top_category_slug=top_category_slug,
                 find_item_id=primary_item_id,
                 tag_item_ids=tag_item_ids,
             )
@@ -1058,7 +1036,7 @@ async def create_find(
                 id=f"rec_{len(MOCK_FINDS) + 1:03d}",
                 userId=effective_user_id,
                 date=request.date,
-                categoryPaths=request.categoryPaths,
+                categoryPaths=request.categoryPaths or [],
                 title=request.title,
                 description=request.description,
                 clusterHash=request.clusterHash,
@@ -1207,10 +1185,11 @@ async def update_find(
     try:
         if settings.data_source_mode == "db":
             item_context = None
-            top_category_slug = None
             find_item_id = None
             tag_item_ids = None
-            category_paths = request.categoryPaths
+            # category_ids is always server-derived from resolved tag items;
+            # a client-supplied categoryPaths value is never trusted.
+            category_ids = None
 
             if request.itemId is not None or request.tagItemIds is not None:
                 variant = await get_user_active_variant(current_user.user_id)
@@ -1228,21 +1207,8 @@ async def update_find(
                     tag_item_ids=tag_item_ids,
                 )
                 item_context = item_contexts[0]
-                top_category_slugs = {
-                    context["topCategorySlug"] for context in item_contexts if context.get("topCategorySlug")
-                }
-                top_category_slug = next(iter(top_category_slugs)) if len(top_category_slugs) == 1 else None
                 find_item_id = request.itemId or item_context["itemId"]
-                if category_paths is None:
-                    category_paths = []
-                    seen_category_paths = set()
-                    for context in item_contexts:
-                        path = context["categoryPath"][0]
-                        path_key = "/".join(path)
-                        if path_key in seen_category_paths:
-                            continue
-                        seen_category_paths.add(path_key)
-                        category_paths.append(path)
+                category_ids = list({context["categoryId"] for context in item_contexts})
 
             result = await db_update_find(
                 find_id=find_id,
@@ -1252,9 +1218,8 @@ async def update_find(
                 description=request.description,
                 latitude=request.location.latitude if request.location else None,
                 longitude=request.location.longitude if request.location else None,
-                category_paths=category_paths,
+                category_ids=category_ids,
                 period=request.period,
-                top_category_slug=top_category_slug,
                 find_item_id=find_item_id,
                 tag_item_ids=tag_item_ids,
             )
@@ -1307,42 +1272,6 @@ async def delete_find(find_id: str, current_user: AuthUser = Depends(get_current
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete find: {str(e)}")
-
-# ---------- CLUSTERS ENDPOINTS ----------
-
-@app.get("/api/clusters", response_model=List[PublicClusterRecord])
-async def get_clusters(
-    category: Optional[str] = None,
-    from_date: Optional[datetime] = None,
-    to_date: Optional[datetime] = None,
-):
-    """
-    Get aggregated cluster data
-    Returns cluster stats without revealing exact locations
-    """
-    try:
-        if settings.data_source_mode == "db":
-            results_data = await query_clusters(
-                category=category,
-                from_date=from_date,
-                to_date=to_date,
-            )
-            return [PublicClusterRecord(**r) for r in results_data]
-        else:
-            clusters = {
-                "51.5_-0.1": PublicClusterRecord(
-                    clusterHash="51.5_-0.1",
-                    categoryPathCounts={
-                        "nature/forest/tree": 1,
-                        "edible/mushroom/porcini": 1,
-                    },
-                    totalRecords=2,
-                    lastUpdated=datetime.now(),
-                )
-            }
-            return list(clusters.values())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cluster query failed: {str(e)}")
 
 # ============ ERROR HANDLERS ============
 

@@ -40,9 +40,10 @@ def test_apply_find_filters_builds_expected_sql_and_params():
     assert "cluster_hash = $1" in query
     assert "date >= $2" in query
     assert "date <= $3" in query
-    assert "category_paths @> $4::jsonb[]" in query
+    assert "find_categories fc" in query
+    assert "c.slug = $4" in query
     assert "period = ANY($5::varchar[])" in query
-    assert "top_category_slug = $6" in query
+    assert "c.slug = $6" in query
     assert "find_item_id = $7::uuid" in query
     assert "find_item_id = ANY($8::uuid[])" in query
     assert out_params[0] == "48.14_17.11"
@@ -60,11 +61,9 @@ def test_build_find_record_includes_location_only_when_requested():
         "title": "Test title",
         "description": "desc",
         "cluster_hash": "48.14_17.11",
-        "category_paths": [["nature", "forest"]],
         "period": "JAN_1",
         "latitude": 48.14,
         "longitude": 17.11,
-        "top_category_slug": "mushrooms",
         "find_item_id": "00000000-0000-0000-0000-000000000123",
     }
 
@@ -75,6 +74,7 @@ def test_build_find_record_includes_location_only_when_requested():
         images_by_id={"a": [{"thumbnailUrl": "t", "fullUrl": "f", "storageRef": None}]},
         comments_by_id={"a": []},
         tag_item_ids_by_find_id={"a": ["00000000-0000-0000-0000-000000000123"]},
+        category_slugs_by_find_id={"a": ["mushrooms"]},
         include_location=True,
     )
     without_location = _build_find_record(
@@ -84,12 +84,15 @@ def test_build_find_record_includes_location_only_when_requested():
         images_by_id={"a": []},
         comments_by_id={"a": []},
         tag_item_ids_by_find_id={"a": ["00000000-0000-0000-0000-000000000123"]},
+        category_slugs_by_find_id={"a": ["mushrooms"]},
         include_location=False,
     )
 
     assert "location" in with_location
     assert with_location["location"]["latitude"] == 48.14
     assert with_location["title"] == "Test title"
+    assert with_location["categoryPaths"] == [["mushrooms"]]
+    assert with_location["topCategorySlug"] == "mushrooms"
     assert with_location["tagItemIds"] == ["00000000-0000-0000-0000-000000000123"]
     assert "location" not in without_location
 
