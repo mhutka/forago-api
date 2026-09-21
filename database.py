@@ -174,12 +174,32 @@ async def run_migrations() -> None:
         return
 
     async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                filename TEXT PRIMARY KEY,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        applied = {
+            row["filename"]
+            for row in await conn.fetch("SELECT filename FROM schema_migrations")
+        }
+
         for filename in migration_files:
+            if filename in applied:
+                continue
             filepath = os.path.join(migrations_dir, filename)
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     sql = f.read()
-                await conn.execute(sql)
+                async with conn.transaction():
+                    await conn.execute(sql)
+                    await conn.execute(
+                        "INSERT INTO schema_migrations (filename) VALUES ($1)",
+                        filename,
+                    )
                 logger.info("Migration executed: %s", filename)
             except Exception as e:
                 logger.error(
