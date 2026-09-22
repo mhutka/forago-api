@@ -544,6 +544,18 @@ def _validate_filter_periods(period: Optional[str], periods: Optional[List[str]]
         )
 
 
+def _normalize_search_query(value: Optional[str]) -> Optional[str]:
+    """Trim and bound user-entered full-text queries."""
+    if value is None:
+        return None
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    if len(normalized) > 120:
+        raise HTTPException(status_code=400, detail="Search query must be at most 120 characters")
+    return normalized
+
+
 # ============ ROUTES ============
 
 @app.get("/api/auth/me", response_model=AuthMeResponse)
@@ -841,6 +853,7 @@ async def get_public_finds(
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
     periods: Optional[List[str]] = None,
+    q: Optional[str] = None,
 ):
     """
     Get all public finds (visible to all users)
@@ -848,6 +861,7 @@ async def get_public_finds(
     """
     try:
         _validate_filter_periods(period, periods)
+        search_query = _normalize_search_query(q)
         if settings.data_source_mode == "db":
             results_data = await query_public_finds(
                 cluster=cluster,
@@ -859,6 +873,7 @@ async def get_public_finds(
                 to_date=to_date,
                 period=period,
                 periods=periods,
+                search_query=search_query,
             )
             return [PublicFindRecord(**r) for r in results_data]
         else:
@@ -877,7 +892,18 @@ async def get_public_finds(
             if period or periods:
                 results = [f for f in results if _matches_period_filter(f, period, periods)]
 
+            if search_query:
+                needle = search_query.lower()
+                results = [
+                    f for f in results
+                    if needle in (f.title or '').lower()
+                    or needle in f.description.lower()
+                    or any(needle in '/'.join(path).lower() for path in f.categoryPaths)
+                ]
+
             return results
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -895,10 +921,12 @@ async def get_finds_nearby(
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
     periods: Optional[List[str]] = None,
+    q: Optional[str] = None,
 ):
     """Get finds near a specific cluster"""
     try:
         _validate_filter_periods(period, periods)
+        search_query = _normalize_search_query(q)
         if settings.data_source_mode == "db":
             results_data = await query_finds_nearby(
                 cluster=cluster,
@@ -910,6 +938,7 @@ async def get_finds_nearby(
                 to_date=to_date,
                 period=period,
                 periods=periods,
+                search_query=search_query,
             )
             return [PublicFindRecord(**r) for r in results_data]
         else:
@@ -929,7 +958,18 @@ async def get_finds_nearby(
             if period or periods:
                 results = [f for f in results if _matches_period_filter(f, period, periods)]
 
+            if search_query:
+                needle = search_query.lower()
+                results = [
+                    f for f in results
+                    if needle in (f.title or '').lower()
+                    or needle in f.description.lower()
+                    or any(needle in '/'.join(path).lower() for path in f.categoryPaths)
+                ]
+
             return results
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -947,6 +987,7 @@ async def get_private_finds(
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
     periods: Optional[List[str]] = None,
+    q: Optional[str] = None,
     current_user: AuthUser = Depends(get_current_user),
 ):
     """
@@ -955,6 +996,7 @@ async def get_private_finds(
     """
     try:
         _validate_filter_periods(period, periods)
+        search_query = _normalize_search_query(q)
         effective_user_id = current_user.user_id
 
         if settings.data_source_mode == "db":
@@ -969,6 +1011,7 @@ async def get_private_finds(
                 to_date=to_date,
                 period=period,
                 periods=periods,
+                search_query=search_query,
             )
             return [PrivateFindRecord(**r) for r in results_data]
         else:
@@ -989,7 +1032,18 @@ async def get_private_finds(
             if period or periods:
                 results = [f for f in results if _matches_period_filter(f, period, periods)]
 
+            if search_query:
+                needle = search_query.lower()
+                results = [
+                    f for f in results
+                    if needle in (f.title or '').lower()
+                    or needle in f.description.lower()
+                    or any(needle in '/'.join(path).lower() for path in f.categoryPaths)
+                ]
+
             return results
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,

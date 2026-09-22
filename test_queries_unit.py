@@ -53,6 +53,28 @@ def test_apply_find_filters_builds_expected_sql_and_params():
     assert out_params[7] == ["00000000-0000-0000-0000-000000000124"]
 
 
+def test_apply_find_filters_adds_fulltext_search_across_find_metadata():
+    query, params = _apply_find_filters(
+        query="SELECT * FROM finds WHERE allow_public = TRUE",
+        params=[],
+        cluster=None,
+        category=None,
+        from_date=None,
+        to_date=None,
+        period=None,
+        periods=None,
+        top_category_slug=None,
+        item_id=None,
+        tag_item_ids=None,
+        search_query="porcini forest",
+    )
+
+    assert "websearch_to_tsquery('simple', $1)" in query
+    assert "category_item_translations" in query
+    assert "profiles p" in query
+    assert params == ["porcini forest"]
+
+
 def test_build_find_record_includes_location_only_when_requested():
     row = {
         "id": "a",

@@ -188,6 +188,7 @@ def _apply_find_filters(
     top_category_slug: Optional[str],
     item_id: Optional[str],
     tag_item_ids: Optional[List[str]] = None,
+    search_query: Optional[str] = None,
 ) -> Tuple[str, List[Any]]:
     """Apply common filters used by public/private find queries."""
     if cluster:
@@ -245,6 +246,21 @@ def _apply_find_filters(
         )
         params.append(tag_item_ids)
 
+    if search_query:
+        idx = len(params) + 1
+        query += (
+            " AND ("
+            f"to_tsvector('simple', COALESCE(finds.title, '') || ' ' || COALESCE(finds.description, '')) "
+            f"@@ websearch_to_tsquery('simple', ${idx}) "
+            f"OR EXISTS (SELECT 1 FROM find_tag_items fti "
+            f"JOIN category_item_translations cit ON cit.item_id = fti.category_item_id "
+            f"WHERE fti.find_id = finds.id AND cit.search_tsv @@ websearch_to_tsquery('simple', ${idx}) ) "
+            f"OR EXISTS (SELECT 1 FROM profiles p "
+            f"WHERE p.id = finds.user_id AND p.display_nickname ILIKE '%' || ${idx} || '%')"
+            ")"
+        )
+        params.append(search_query)
+
     return query, params
 
 
@@ -296,6 +312,7 @@ async def query_public_finds(
     top_category_slug: Optional[str] = None,
     item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
+    search_query: Optional[str] = None,
 ) -> List[dict]:
     """Query public finds with shared filters."""
     conn = await get_db_connection()
@@ -320,6 +337,7 @@ async def query_public_finds(
             top_category_slug=top_category_slug,
             item_id=item_id,
             tag_item_ids=tag_item_ids,
+            search_query=search_query,
         )
 
         query += " ORDER BY date DESC"
@@ -365,6 +383,7 @@ async def query_private_finds(
     top_category_slug: Optional[str] = None,
     item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
+    search_query: Optional[str] = None,
 ) -> List[dict]:
     """Query private finds for a specific user with shared filters."""
     conn = await get_db_connection()
@@ -390,6 +409,7 @@ async def query_private_finds(
             top_category_slug=top_category_slug,
             item_id=item_id,
             tag_item_ids=tag_item_ids,
+            search_query=search_query,
         )
 
         query += " ORDER BY date DESC"
@@ -434,6 +454,7 @@ async def query_finds_nearby(
     top_category_slug: Optional[str] = None,
     item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
+    search_query: Optional[str] = None,
 ) -> List[dict]:
     """
     Query finds in a specific cluster (public view, no exact location)
@@ -448,6 +469,7 @@ async def query_finds_nearby(
         top_category_slug=top_category_slug,
         item_id=item_id,
         tag_item_ids=tag_item_ids,
+        search_query=search_query,
     )
 
 
