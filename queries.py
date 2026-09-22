@@ -136,6 +136,34 @@ async def _replace_find_categories(conn: Any, find_id: Any, category_ids: List[s
     )
 
 
+async def resolve_category_ids(
+    app_variant_id: str,
+    category_slugs: List[str],
+) -> List[str]:
+    """Resolve active top-level category slugs for an app variant."""
+    if not category_slugs:
+        return []
+
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT id, slug
+            FROM categories
+            WHERE app_variant_id = $1::uuid
+              AND parent_category_id IS NULL
+              AND is_active = TRUE
+              AND slug = ANY($2::text[])
+            """,
+            app_variant_id,
+            category_slugs,
+        )
+        ids_by_slug = {row["slug"]: str(row["id"]) for row in rows}
+        return [ids_by_slug[slug] for slug in category_slugs if slug in ids_by_slug]
+    finally:
+        await release_db_connection(conn)
+
+
 async def _fetch_display_nicknames(conn: Any, user_ids: List[Any]) -> Dict[str, str]:
     """Fetch display nicknames for a set of user UUIDs."""
     if not user_ids:
@@ -778,22 +806,34 @@ async def update_find(
             params.append(find_item_id)
             set_parts.append(f"find_item_id = ${len(params)}::uuid")
 
-        if not set_parts:
+        if not set_parts and tag_item_ids is None and category_ids is None:
             return await get_find_by_id(find_id, user_id)
 
-        set_parts.append("updated_at = now()")
+        if set_parts:
+            set_parts.append("updated_at = now()")
         params.append(find_id)
         params.append(user_id)
 
-        query = f"""
-            UPDATE finds SET {', '.join(set_parts)}
-                        WHERE id = ${len(params) - 1}::uuid
-                            AND user_id = ${len(params)}::uuid
-            RETURNING id, user_id, date, title, description, cluster_hash,
-                      latitude, longitude, period, find_item_id
-        """
-
-        row = await conn.fetchrow(query, *params)
+        if set_parts:
+            query = f"""
+                UPDATE finds SET {', '.join(set_parts)}
+                            WHERE id = ${len(params) - 1}::uuid
+                                AND user_id = ${len(params)}::uuid
+                RETURNING id, user_id, date, title, description, cluster_hash,
+                          latitude, longitude, period, find_item_id
+            """
+            row = await conn.fetchrow(query, *params)
+        else:
+            row = await conn.fetchrow(
+                """
+                SELECT id, user_id, date, title, description, cluster_hash,
+                       latitude, longitude, period, find_item_id
+                FROM finds
+                WHERE id = $1::uuid AND user_id = $2::uuid
+                """,
+                find_id,
+                user_id,
+            )
         if row is None:
             return None
 

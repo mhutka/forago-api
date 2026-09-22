@@ -36,6 +36,7 @@ from queries import (
     list_category_items,
     create_category_item,
     resolve_item_context,
+    resolve_category_ids,
     update_user_profile,
     insert_find_comment,
 )
@@ -401,6 +402,18 @@ async def _resolve_tag_item_contexts(
         contexts.append(item_context)
 
     return contexts
+
+
+def _category_slugs_from_paths(category_paths: Optional[List[List[str]]]) -> List[str]:
+    """Extract unique top-level slugs from client-provided category paths."""
+    slugs: List[str] = []
+    for path in category_paths or []:
+        if not path or not isinstance(path[0], str):
+            continue
+        slug = path[0].strip().lower()
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    return slugs
 
 # ============ MOCK DATA (temporary) ============
 MOCK_FINDS = {
@@ -1013,7 +1026,14 @@ async def create_find(
                 tag_item_ids=tag_item_ids,
             )
             primary_item_id = request.itemId or item_contexts[0]["itemId"]
-            category_ids = list({context["categoryId"] for context in item_contexts})
+            derived_category_ids = [context["categoryId"] for context in item_contexts]
+            category_slugs = _category_slugs_from_paths(request.categoryPaths)
+            explicit_category_ids = await resolve_category_ids(
+                variant["id"], category_slugs,
+            )
+            if len(explicit_category_ids) != len(category_slugs):
+                raise HTTPException(status_code=400, detail="Invalid category path")
+            category_ids = list(dict.fromkeys(explicit_category_ids + derived_category_ids))
 
             result_data = await insert_find(
                 user_id=effective_user_id,
@@ -1047,6 +1067,8 @@ async def create_find(
             )
             MOCK_FINDS[new_find.id] = new_find
             return new_find
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -1187,28 +1209,41 @@ async def update_find(
             item_context = None
             find_item_id = None
             tag_item_ids = None
-            # category_ids is always server-derived from resolved tag items;
-            # a client-supplied categoryPaths value is never trusted.
+            # Category paths are validated against the active app variant;
+            # tag-derived categories are retained for older clients.
             category_ids = None
 
-            if request.itemId is not None or request.tagItemIds is not None:
+            if (
+                request.itemId is not None
+                or request.tagItemIds is not None
+                or request.categoryPaths is not None
+            ):
                 variant = await get_user_active_variant(current_user.user_id)
                 if variant is None:
                     raise HTTPException(status_code=404, detail="No active variant found for user")
                 profile = await get_user_profile(current_user.user_id)
                 language_code = (profile or {}).get("languageCode") or variant["defaultLanguageCode"]
-                tag_item_ids = _normalize_tag_item_ids(request.tagItemIds, request.itemId)
-                if not tag_item_ids:
-                    raise HTTPException(status_code=400, detail="At least one tag item is required when updating item tags")
-                item_contexts = await _resolve_tag_item_contexts(
-                    user_id=current_user.user_id,
-                    app_variant_id=variant["id"],
-                    language_code=language_code,
-                    tag_item_ids=tag_item_ids,
+                item_contexts = []
+                if request.itemId is not None or request.tagItemIds is not None:
+                    tag_item_ids = _normalize_tag_item_ids(request.tagItemIds, request.itemId)
+                    if not tag_item_ids:
+                        raise HTTPException(status_code=400, detail="At least one tag item is required when updating item tags")
+                    item_contexts = await _resolve_tag_item_contexts(
+                        user_id=current_user.user_id,
+                        app_variant_id=variant["id"],
+                        language_code=language_code,
+                        tag_item_ids=tag_item_ids,
+                    )
+                    item_context = item_contexts[0]
+                    find_item_id = request.itemId or item_context["itemId"]
+                derived_category_ids = [context["categoryId"] for context in item_contexts]
+                category_slugs = _category_slugs_from_paths(request.categoryPaths)
+                explicit_category_ids = await resolve_category_ids(
+                    variant["id"], category_slugs,
                 )
-                item_context = item_contexts[0]
-                find_item_id = request.itemId or item_context["itemId"]
-                category_ids = list({context["categoryId"] for context in item_contexts})
+                if len(explicit_category_ids) != len(category_slugs):
+                    raise HTTPException(status_code=400, detail="Invalid category path")
+                category_ids = list(dict.fromkeys(explicit_category_ids + derived_category_ids))
 
             result = await db_update_find(
                 find_id=find_id,
