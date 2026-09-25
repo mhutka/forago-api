@@ -71,6 +71,8 @@ def test_apply_find_filters_adds_fulltext_search_across_find_metadata():
 
     assert "websearch_to_tsquery('simple', $1)" in query
     assert "category_item_translations" in query
+    assert "category_translations" in query
+    assert "LOWER(COALESCE(finds.title" in query
     assert "profiles p" in query
     assert params == ["porcini forest"]
 
