@@ -99,6 +99,7 @@ def test_build_find_record_includes_location_only_when_requested():
         comments_by_id={"a": []},
         tag_item_ids_by_find_id={"a": ["00000000-0000-0000-0000-000000000123"]},
         category_slugs_by_find_id={"a": ["mushrooms"]},
+        item_titles_by_id={"00000000-0000-0000-0000-000000000123": "Hríb smrekový"},
         include_location=True,
     )
     without_location = _build_find_record(
@@ -109,6 +110,7 @@ def test_build_find_record_includes_location_only_when_requested():
         comments_by_id={"a": []},
         tag_item_ids_by_find_id={"a": ["00000000-0000-0000-0000-000000000123"]},
         category_slugs_by_find_id={"a": ["mushrooms"]},
+        item_titles_by_id={"00000000-0000-0000-0000-000000000123": "Hríb smrekový"},
         include_location=False,
     )
 
@@ -118,6 +120,8 @@ def test_build_find_record_includes_location_only_when_requested():
     assert with_location["categoryPaths"] == [["mushrooms"]]
     assert with_location["topCategorySlug"] == "mushrooms"
     assert with_location["tagItemIds"] == ["00000000-0000-0000-0000-000000000123"]
+    assert with_location["itemLabel"] == "Hríb smrekový"
+    assert with_location["itemLabels"] == ["Hríb smrekový"]
     assert "location" not in without_location
 
 

@@ -80,6 +80,33 @@ async def _fetch_find_tag_item_ids(conn: Any, find_uuids: List[Any]) -> Dict[str
     return tag_item_ids_by_find_id
 
 
+async def _fetch_item_titles(
+    conn: Any,
+    item_ids: List[str],
+    language_code: str = "sk",
+) -> Dict[str, str]:
+    """Batch-fetch category item titles for a list of item ids (single language)."""
+    unique_ids = [i for i in dict.fromkeys(item_ids) if i]
+    if not unique_ids:
+        return {}
+
+    rows = await conn.fetch(
+        """
+        SELECT ci.id, COALESCE(cit.title, cit_fallback.title) AS title
+        FROM category_items ci
+        LEFT JOIN category_item_translations cit
+          ON cit.item_id = ci.id AND cit.language_code = $2
+        LEFT JOIN category_item_translations cit_fallback
+          ON cit_fallback.item_id = ci.id AND cit_fallback.language_code = 'sk'
+        WHERE ci.id = ANY($1::uuid[])
+        """,
+        unique_ids,
+        language_code,
+    )
+
+    return {str(row["id"]): row["title"] for row in rows if row["title"] is not None}
+
+
 async def _replace_find_tag_items(conn: Any, find_id: Any, tag_item_ids: List[str]) -> None:
     """Replace item-tag rows for one find."""
     await conn.execute("DELETE FROM find_tag_items WHERE find_id = $1::uuid", find_id)
@@ -282,10 +309,13 @@ def _build_find_record(
     comments_by_id: Dict[str, list],
     tag_item_ids_by_find_id: Dict[str, List[str]],
     category_slugs_by_find_id: Dict[str, List[str]],
+    item_titles_by_id: Dict[str, str],
     include_location: bool,
 ) -> Dict[str, Any]:
     """Build API record payload from a DB row."""
     category_slugs = category_slugs_by_find_id.get(fid, [])
+    item_id = str(row["find_item_id"]) if row.get("find_item_id") is not None else None
+    tag_item_ids = tag_item_ids_by_find_id.get(fid, [])
     payload: Dict[str, Any] = {
         "id": fid,
         "userId": str(row["user_id"]),
@@ -297,8 +327,12 @@ def _build_find_record(
         "categoryPaths": [[slug] for slug in category_slugs],
         "period": row["period"],
         "topCategorySlug": category_slugs[0] if len(category_slugs) == 1 else None,
-        "itemId": str(row["find_item_id"]) if row.get("find_item_id") is not None else None,
-        "tagItemIds": tag_item_ids_by_find_id.get(fid, []),
+        "itemId": item_id,
+        "tagItemIds": tag_item_ids,
+        "itemLabel": item_titles_by_id.get(item_id) if item_id else None,
+        "itemLabels": [
+            item_titles_by_id[tid] for tid in tag_item_ids if tid in item_titles_by_id
+        ],
         "images": images_by_id.get(fid, []),
         "comments": comments_by_id.get(fid, []),
     }
@@ -360,6 +394,10 @@ async def query_public_finds(
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, find_uuids)
         nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
+        all_item_ids = [str(row["find_item_id"]) for row in rows if row.get("find_item_id") is not None]
+        for ids in tag_item_ids_by_find_id.values():
+            all_item_ids.extend(ids)
+        item_titles_by_id = await _fetch_item_titles(conn, all_item_ids)
 
         results = []
         for row in rows:
@@ -373,6 +411,7 @@ async def query_public_finds(
                     comments_by_id=comments_by_id,
                     tag_item_ids_by_find_id=tag_item_ids_by_find_id,
                     category_slugs_by_find_id=category_slugs_by_find_id,
+                    item_titles_by_id=item_titles_by_id,
                     include_location=False,
                 )
             )
@@ -432,6 +471,10 @@ async def query_private_finds(
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, find_uuids)
         nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
+        all_item_ids = [str(row["find_item_id"]) for row in rows if row.get("find_item_id") is not None]
+        for ids in tag_item_ids_by_find_id.values():
+            all_item_ids.extend(ids)
+        item_titles_by_id = await _fetch_item_titles(conn, all_item_ids)
 
         results = []
         for row in rows:
@@ -445,6 +488,7 @@ async def query_private_finds(
                     comments_by_id=comments_by_id,
                     tag_item_ids_by_find_id=tag_item_ids_by_find_id,
                     category_slugs_by_find_id=category_slugs_by_find_id,
+                    item_titles_by_id=item_titles_by_id,
                     include_location=True,
                 )
             )

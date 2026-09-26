@@ -150,6 +150,8 @@ class PublicFindRecord(BaseModel):
     topCategorySlug: Optional[str] = None
     itemId: Optional[str] = None
     tagItemIds: List[str] = Field(default_factory=list)
+    itemLabel: Optional[str] = None
+    itemLabels: List[str] = Field(default_factory=list)
     images: List[RecordImageRef] = Field(default_factory=list)
     comments: List[RecordComment] = Field(default_factory=list)
 
