@@ -87,7 +87,7 @@ VALUES
         {"slug": "herbs", "iconKey": "leaf"},
         {"slug": "birds", "iconKey": "bird"},
         {"slug": "fish", "iconKey": "fish"},
-        {"slug": "butterflies", "iconKey": "butterfly"},
+        {"slug": "wildlife", "iconKey": "wildlife"},
         {"slug": "insects", "iconKey": "insect"}
       ]
     }'::jsonb,
@@ -107,7 +107,7 @@ VALUES
         {"slug": "herbs", "iconKey": "leaf"},
         {"slug": "birds", "iconKey": "bird"},
         {"slug": "fish", "iconKey": "fish"},
-        {"slug": "butterflies", "iconKey": "butterfly"},
+        {"slug": "wildlife", "iconKey": "wildlife"},
         {"slug": "insects", "iconKey": "insect"}
       ]
     }'::jsonb,

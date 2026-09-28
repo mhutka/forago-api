@@ -721,7 +721,7 @@ async def get_active_variant(current_user: AuthUser = Depends(get_current_user))
                         {"slug": "herbs", "iconKey": "leaf"},
                         {"slug": "birds", "iconKey": "bird"},
                         {"slug": "fish", "iconKey": "fish"},
-                        {"slug": "butterflies", "iconKey": "butterfly"},
+                        {"slug": "wildlife", "iconKey": "wildlife"},
                         {"slug": "insects", "iconKey": "insect"},
                     ]
                 },
@@ -748,7 +748,7 @@ async def get_top_categories(current_user: AuthUser = Depends(get_current_user))
                 TopCategoryResponse(id="mock-herbs", slug="herbs", iconKey="leaf", label="Bylinky", sortOrder=20),
                 TopCategoryResponse(id="mock-birds", slug="birds", iconKey="bird", label="Vtaky", sortOrder=30),
                 TopCategoryResponse(id="mock-fish", slug="fish", iconKey="fish", label="Ryby", sortOrder=40),
-                TopCategoryResponse(id="mock-butterflies", slug="butterflies", iconKey="butterfly", label="Motyle", sortOrder=50),
+                TopCategoryResponse(id="mock-wildlife", slug="wildlife", iconKey="wildlife", label="Zver", sortOrder=50),
                 TopCategoryResponse(id="mock-insects", slug="insects", iconKey="insect", label="Hmyz", sortOrder=60),
             ]
 

@@ -14,7 +14,7 @@ CROSS JOIN (
         ('herbs', 'leaf', 20),
         ('birds', 'bird', 30),
         ('fish', 'fish', 40),
-        ('butterflies', 'butterfly', 50),
+        ('wildlife', 'wildlife', 50),
         ('insects', 'insect', 60)
 ) AS c(slug, icon_key, sort_order)
 ON CONFLICT (app_variant_id, slug) DO UPDATE
@@ -29,13 +29,13 @@ WITH labels AS (
     SELECT 'herbs', 'sk', 'Bylinky' UNION ALL
     SELECT 'birds', 'sk', 'Vtaky' UNION ALL
     SELECT 'fish', 'sk', 'Ryby' UNION ALL
-    SELECT 'butterflies', 'sk', 'Motyle' UNION ALL
+    SELECT 'wildlife', 'sk', 'Zver' UNION ALL
     SELECT 'insects', 'sk', 'Hmyz' UNION ALL
     SELECT 'mushrooms', 'cs', 'Houby' UNION ALL
     SELECT 'herbs', 'cs', 'Bylinky' UNION ALL
     SELECT 'birds', 'cs', 'Ptaci' UNION ALL
     SELECT 'fish', 'cs', 'Ryby' UNION ALL
-    SELECT 'butterflies', 'cs', 'Motyli' UNION ALL
+    SELECT 'wildlife', 'cs', 'Zvířata' UNION ALL
     SELECT 'insects', 'cs', 'Hmyz'
 )
 INSERT INTO category_translations (category_id, language_code, label, description_text)
