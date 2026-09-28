@@ -1,6 +1,7 @@
 import importlib
 import os
 import sys
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from jose import jwt
@@ -31,6 +32,18 @@ def test_health_endpoint_returns_ok():
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["dataSourceMode"] == "mock"
+
+
+def test_fetch_rejects_synthetic_tag_item_ids_before_database_query(monkeypatch):
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+
+    response = client.get(
+        "/api/finds/public",
+        params={"tagItemIds": ["unknown-wildlife"]},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "Invalid category item ID; expected a UUID."
 
 
 def test_create_find_rejects_invalid_period():

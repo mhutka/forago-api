@@ -8,8 +8,9 @@ import logging.handlers
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from datetime import datetime
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends, Query, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -380,6 +381,19 @@ def _normalize_tag_item_ids(tag_item_ids: Optional[List[str]], item_id: Optional
         normalized.append(value)
 
     return normalized
+
+
+def _validate_category_item_ids(item_id: Optional[str], tag_item_ids: Optional[List[str]]) -> None:
+    """Reject synthetic or malformed item keys before PostgreSQL UUID casts."""
+    candidates = ([item_id] if item_id is not None else []) + (tag_item_ids or [])
+    for candidate in candidates:
+        try:
+            UUID(candidate)
+        except (AttributeError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid category item ID; expected a UUID.",
+            )
 
 
 async def _resolve_tag_item_contexts(
@@ -850,11 +864,11 @@ async def get_public_finds(
     category: Optional[str] = None,
     topCategorySlug: Optional[str] = None,
     itemId: Optional[str] = None,
-    tagItemIds: Optional[List[str]] = None,
+    tagItemIds: Optional[List[str]] = Query(default=None),
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
-    periods: Optional[List[str]] = None,
+    periods: Optional[List[str]] = Query(default=None),
     q: Optional[str] = None,
 ):
     """
@@ -865,6 +879,7 @@ async def get_public_finds(
         _validate_filter_periods(period, periods)
         search_query = _normalize_search_query(q)
         if settings.data_source_mode == "db":
+            _validate_category_item_ids(itemId, tagItemIds)
             results_data = await query_public_finds(
                 cluster=cluster,
                 category=category,
@@ -918,11 +933,11 @@ async def get_finds_nearby(
     category: Optional[str] = None,
     topCategorySlug: Optional[str] = None,
     itemId: Optional[str] = None,
-    tagItemIds: Optional[List[str]] = None,
+    tagItemIds: Optional[List[str]] = Query(default=None),
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
-    periods: Optional[List[str]] = None,
+    periods: Optional[List[str]] = Query(default=None),
     q: Optional[str] = None,
 ):
     """Get finds near a specific cluster"""
@@ -930,6 +945,7 @@ async def get_finds_nearby(
         _validate_filter_periods(period, periods)
         search_query = _normalize_search_query(q)
         if settings.data_source_mode == "db":
+            _validate_category_item_ids(itemId, tagItemIds)
             results_data = await query_finds_nearby(
                 cluster=cluster,
                 category=category,
@@ -984,11 +1000,11 @@ async def get_private_finds(
     category: Optional[str] = None,
     topCategorySlug: Optional[str] = None,
     itemId: Optional[str] = None,
-    tagItemIds: Optional[List[str]] = None,
+    tagItemIds: Optional[List[str]] = Query(default=None),
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     period: Optional[str] = None,
-    periods: Optional[List[str]] = None,
+    periods: Optional[List[str]] = Query(default=None),
     q: Optional[str] = None,
     current_user: AuthUser = Depends(get_current_user),
 ):
@@ -1002,6 +1018,7 @@ async def get_private_finds(
         effective_user_id = current_user.user_id
 
         if settings.data_source_mode == "db":
+            _validate_category_item_ids(itemId, tagItemIds)
             results_data = await query_private_finds(
                 user_id=effective_user_id,
                 cluster=cluster,
@@ -1065,6 +1082,7 @@ async def create_find(
         effective_user_id = current_user.user_id
 
         if settings.data_source_mode == "db":
+            _validate_category_item_ids(request.itemId, request.tagItemIds)
             tag_item_ids = _normalize_tag_item_ids(request.tagItemIds, request.itemId)
             if not tag_item_ids:
                 raise HTTPException(status_code=400, detail="At least one tag item is required. Use the 'unknown' item when needed.")
