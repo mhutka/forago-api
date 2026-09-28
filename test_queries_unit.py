@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import queries
-from queries import _apply_find_filters, _build_find_record, _period_for_date
+from queries import _apply_find_filters, _build_find_record, _period_for_date, insert_find
 
 
 @pytest.mark.parametrize(
@@ -123,6 +123,76 @@ def test_build_find_record_includes_location_only_when_requested():
     assert with_location["itemLabel"] == "Hríb smrekový"
     assert with_location["itemLabels"] == ["Hríb smrekový"]
     assert "location" not in without_location
+
+
+@pytest.mark.asyncio
+async def test_insert_find_returns_item_labels(monkeypatch):
+    find_id = "find-1"
+    item_id = "00000000-0000-0000-0000-000000000123"
+    user_id = "00000000-0000-0000-0000-000000000456"
+    row = {
+        "id": find_id,
+        "user_id": user_id,
+        "date": datetime(2026, 9, 28),
+        "title": "First animal",
+        "description": "A wildlife find",
+        "cluster_hash": "181_70",
+        "latitude": 49.13,
+        "longitude": 19.06,
+        "period": "SEP_2",
+        "find_item_id": item_id,
+    }
+    conn = AsyncMock()
+    conn.fetchrow.return_value = row
+    released = AsyncMock()
+
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    monkeypatch.setattr(queries, "release_db_connection", released)
+    monkeypatch.setattr(queries, "_replace_find_tag_items", AsyncMock())
+    monkeypatch.setattr(queries, "_replace_find_categories", AsyncMock())
+    monkeypatch.setattr(
+        queries,
+        "_fetch_images_and_comments",
+        AsyncMock(return_value=({}, {})),
+    )
+    monkeypatch.setattr(
+        queries,
+        "_fetch_find_tag_item_ids",
+        AsyncMock(return_value={find_id: [item_id]}),
+    )
+    monkeypatch.setattr(
+        queries,
+        "_fetch_find_category_slugs",
+        AsyncMock(return_value={find_id: ["wildlife"]}),
+    )
+    monkeypatch.setattr(
+        queries,
+        "_fetch_display_nicknames",
+        AsyncMock(return_value={user_id: "tester"}),
+    )
+    monkeypatch.setattr(
+        queries,
+        "_fetch_item_titles",
+        AsyncMock(return_value={item_id: "Unknown"}),
+    )
+
+    result = await insert_find(
+        user_id=user_id,
+        app_variant_id="00000000-0000-0000-0000-000000000789",
+        date=datetime(2026, 9, 28),
+        title="First animal",
+        description="A wildlife find",
+        cluster_hash="181_70",
+        latitude=49.13,
+        longitude=19.06,
+        category_ids=["00000000-0000-0000-0000-000000000321"],
+        find_item_id=item_id,
+        tag_item_ids=[item_id],
+    )
+
+    assert result["itemLabel"] == "Unknown"
+    assert result["itemLabels"] == ["Unknown"]
+    released.assert_awaited_once_with(conn)
 
 
 @pytest.mark.asyncio

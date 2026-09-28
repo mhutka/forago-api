@@ -107,6 +107,19 @@ async def _fetch_item_titles(
     return {str(row["id"]): row["title"] for row in rows if row["title"] is not None}
 
 
+async def _fetch_record_item_titles(
+    conn: Any,
+    row: Any,
+    find_id: str,
+    tag_item_ids_by_find_id: Dict[str, List[str]],
+) -> Dict[str, str]:
+    """Fetch display titles for one find's primary item and tag items."""
+    find_item_id = row.get("find_item_id")
+    item_ids = [str(find_item_id)] if find_item_id is not None else []
+    item_ids.extend(tag_item_ids_by_find_id.get(find_id, []))
+    return await _fetch_item_titles(conn, item_ids)
+
+
 async def _replace_find_tag_items(conn: Any, find_id: Any, tag_item_ids: List[str]) -> None:
     """Replace item-tag rows for one find."""
     await conn.execute("DELETE FROM find_tag_items WHERE find_id = $1::uuid", find_id)
@@ -579,6 +592,9 @@ async def insert_find(
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
+        item_titles_by_id = await _fetch_record_item_titles(
+            conn, row, fid, tag_item_ids_by_find_id
+        )
         return _build_find_record(
             row=row,
             fid=fid,
@@ -587,6 +603,7 @@ async def insert_find(
             comments_by_id=comments_by_id,
             tag_item_ids_by_find_id=tag_item_ids_by_find_id,
             category_slugs_by_find_id=category_slugs_by_find_id,
+            item_titles_by_id=item_titles_by_id,
             include_location=True,
         )
     finally:
@@ -614,6 +631,9 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
+        item_titles_by_id = await _fetch_record_item_titles(
+            conn, row, fid, tag_item_ids_by_find_id
+        )
         return _build_find_record(
             row=row,
             fid=fid,
@@ -622,6 +642,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
             comments_by_id=comments_by_id,
             tag_item_ids_by_find_id=tag_item_ids_by_find_id,
             category_slugs_by_find_id=category_slugs_by_find_id,
+            item_titles_by_id=item_titles_by_id,
             include_location=True,
         )
     finally:
@@ -923,6 +944,9 @@ async def update_find(
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
+        item_titles_by_id = await _fetch_record_item_titles(
+            conn, row, fid, tag_item_ids_by_find_id
+        )
         return _build_find_record(
             row=row,
             fid=fid,
@@ -931,6 +955,7 @@ async def update_find(
             comments_by_id=comments_by_id,
             tag_item_ids_by_find_id=tag_item_ids_by_find_id,
             category_slugs_by_find_id=category_slugs_by_find_id,
+            item_titles_by_id=item_titles_by_id,
             include_location=True,
         )
     finally:
