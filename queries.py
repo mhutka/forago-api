@@ -3,7 +3,22 @@
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 import re
+import unicodedata
 from database import get_db_connection, release_db_connection
+
+_ACCENTED_CHARS = "áäčďéěíĺľňóôöŕřšťúůüýž"
+_PLAIN_CHARS = "aacdeeillnooorrstuuuyz"
+
+
+def strip_diacritics(value: str) -> str:
+    """Lowercase text and remove diacritics (e.g. 'Jaseň' -> 'jasen')."""
+    decomposed = unicodedata.normalize("NFKD", value.lower())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def sql_fold(expr: str) -> str:
+    """SQL expression that lowercases and strips diacritics, matching strip_diacritics()."""
+    return f"translate(LOWER({expr}), '{_ACCENTED_CHARS}', '{_PLAIN_CHARS}')"
 
 
 def _period_for_date(value: datetime) -> str:
@@ -288,28 +303,33 @@ def _apply_find_filters(
 
     if search_query:
         idx = len(params) + 1
+        like = f"LIKE '%' || ${idx + 1} || '%'"
+        find_text = sql_fold("COALESCE(finds.title, '') || ' ' || COALESCE(finds.description, '')")
+        item_text = sql_fold("COALESCE(cit.title, '') || ' ' || COALESCE(cit.description_text, '')")
+        cat_label = sql_fold("ct.label")
+        cat_desc = sql_fold("COALESCE(ct.description_text, '')")
+        nickname = sql_fold("p.display_nickname")
         query += (
             " AND ("
             f"to_tsvector('simple', COALESCE(finds.title, '') || ' ' || COALESCE(finds.description, '')) "
             f"@@ websearch_to_tsquery('simple', ${idx}) "
-            f"OR LOWER(COALESCE(finds.title, '') || ' ' || COALESCE(finds.description, '')) "
-            f"LIKE LOWER('%' || ${idx} || '%') "
+            f"OR {find_text} {like} "
             f"OR EXISTS (SELECT 1 FROM find_tag_items fti "
             f"JOIN category_item_translations cit ON cit.item_id = fti.category_item_id "
             f"WHERE fti.find_id = finds.id AND ("
             f"cit.search_tsv @@ websearch_to_tsquery('simple', ${idx}) "
-            f"OR LOWER(COALESCE(cit.title, '') || ' ' || COALESCE(cit.description_text, '')) "
-            f"LIKE LOWER('%' || ${idx} || '%')) ) "
+            f"OR {item_text} {like}) ) "
             f"OR EXISTS (SELECT 1 FROM find_categories fc "
             f"JOIN category_translations ct ON ct.category_id = fc.category_id "
             f"WHERE fc.find_id = finds.id AND ("
-            f"ct.label ILIKE '%' || ${idx} || '%' "
-            f"OR COALESCE(ct.description_text, '') ILIKE '%' || ${idx} || '%')) "
+            f"{cat_label} {like} "
+            f"OR {cat_desc} {like})) "
             f"OR EXISTS (SELECT 1 FROM profiles p "
-            f"WHERE p.id = finds.user_id AND p.display_nickname ILIKE '%' || ${idx} || '%')"
+            f"WHERE p.id = finds.user_id AND {nickname} {like})"
             ")"
         )
         params.append(search_query)
+        params.append(strip_diacritics(search_query))
 
     return query, params
 
@@ -1095,9 +1115,13 @@ async def list_category_items(
             params.append(top_category_slug)
 
         if q:
-            sql += f" AND (cit.search_tsv @@ websearch_to_tsquery('simple', ${len(params) + 1}) OR LOWER(COALESCE(cit.title, '')) LIKE LOWER(${len(params) + 2}))"
+            title_fold = sql_fold("COALESCE(cit.title, '')")
+            sql += (
+                f" AND (cit.search_tsv @@ websearch_to_tsquery('simple', ${len(params) + 1}) "
+                f"OR {title_fold} LIKE ${len(params) + 2})"
+            )
             params.append(q)
-            params.append(f"%{q}%")
+            params.append(f"%{strip_diacritics(q)}%")
 
         sql += f" ORDER BY COALESCE(p.slug, c.slug), cit.title NULLS LAST, ci.created_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
         params.append(limit)

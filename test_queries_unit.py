@@ -74,7 +74,28 @@ def test_apply_find_filters_adds_fulltext_search_across_find_metadata():
     assert "category_translations" in query
     assert "LOWER(COALESCE(finds.title" in query
     assert "profiles p" in query
-    assert params == ["porcini forest"]
+    assert params == ["porcini forest", "porcini forest"]
+
+
+def test_search_ignores_diacritics_in_params_and_sql():
+    query, params = _apply_find_filters(
+        query="SELECT * FROM finds WHERE allow_public = TRUE",
+        params=[],
+        cluster=None,
+        category=None,
+        from_date=None,
+        to_date=None,
+        period=None,
+        periods=None,
+        top_category_slug=None,
+        item_id=None,
+        tag_item_ids=None,
+        search_query="Jaseň",
+    )
+
+    assert params == ["Jaseň", "jasen"]
+    assert "translate(LOWER(" in query
+    assert queries.strip_diacritics("Čučoriedka ŽLTÝ ľ") == "cucoriedka zlty l"
 
 
 def test_build_find_record_includes_location_only_when_requested():

@@ -22,6 +22,7 @@ from auth import AuthUser, get_current_user, validate_auth_configuration
 from r2_storage import generate_find_image_upload_plans, is_r2_configured
 from version import __version__
 from queries import (
+    strip_diacritics,
     query_public_finds,
     query_private_finds,
     query_finds_nearby,
@@ -910,12 +911,12 @@ async def get_public_finds(
                 results = [f for f in results if _matches_period_filter(f, period, periods)]
 
             if search_query:
-                needle = search_query.lower()
+                needle = strip_diacritics(search_query)
                 results = [
                     f for f in results
-                    if needle in (f.title or '').lower()
-                    or needle in f.description.lower()
-                    or any(needle in '/'.join(path).lower() for path in f.categoryPaths)
+                    if needle in strip_diacritics(f.title or '')
+                    or needle in strip_diacritics(f.description)
+                    or any(needle in strip_diacritics('/'.join(path)) for path in f.categoryPaths)
                 ]
 
             return results
@@ -977,12 +978,12 @@ async def get_finds_nearby(
                 results = [f for f in results if _matches_period_filter(f, period, periods)]
 
             if search_query:
-                needle = search_query.lower()
+                needle = strip_diacritics(search_query)
                 results = [
                     f for f in results
-                    if needle in (f.title or '').lower()
-                    or needle in f.description.lower()
-                    or any(needle in '/'.join(path).lower() for path in f.categoryPaths)
+                    if needle in strip_diacritics(f.title or '')
+                    or needle in strip_diacritics(f.description)
+                    or any(needle in strip_diacritics('/'.join(path)) for path in f.categoryPaths)
                 ]
 
             return results
@@ -1052,12 +1053,12 @@ async def get_private_finds(
                 results = [f for f in results if _matches_period_filter(f, period, periods)]
 
             if search_query:
-                needle = search_query.lower()
+                needle = strip_diacritics(search_query)
                 results = [
                     f for f in results
-                    if needle in (f.title or '').lower()
-                    or needle in f.description.lower()
-                    or any(needle in '/'.join(path).lower() for path in f.categoryPaths)
+                    if needle in strip_diacritics(f.title or '')
+                    or needle in strip_diacritics(f.description)
+                    or any(needle in strip_diacritics('/'.join(path)) for path in f.categoryPaths)
                 ]
 
             return results
