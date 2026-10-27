@@ -4,14 +4,16 @@ This document describes the current, implemented PostgreSQL datamodel based on m
 - 001_create_finds.sql
 - 002_create_find_images.sql
 - 003_create_find_comments.sql
+- 019_create_find_likes_and_comment_flag.sql
 
 ## 1) Entity Relationship Overview
 
 finds (1) ---- (N) find_images
 finds (1) ---- (N) find_comments
+finds (1) ---- (N) find_likes
 
 Delete behavior:
-- Deleting one row from finds cascades to find_images and find_comments.
+- Deleting one row from finds cascades to find_images, find_comments, and find_likes.
 
 ## 2) Tables
 
@@ -82,23 +84,41 @@ Columns:
 - text: TEXT, NOT NULL
 - created_at: TIMESTAMPTZ, NOT NULL, default now()
 - updated_at: TIMESTAMPTZ, NOT NULL, default now()
+- is_misidentification_report: BOOLEAN, NOT NULL, default FALSE
 
 Indexes:
 - idx_find_comments_find_id on (find_id)
 - idx_find_comments_user_id on (user_id)
+- ux_find_comments_one_report_per_user on (find_id, user_id), for flagged rows only
+- idx_find_comments_reports on (find_id), for flagged rows only
+
+### find_likes
+Purpose:
+- One Like from a user on a publicly visible find.
+
+Columns:
+- find_id: UUID, NOT NULL, FOREIGN KEY -> finds(id) ON DELETE CASCADE
+- user_id: UUID, NOT NULL
+- created_at: TIMESTAMPTZ, NOT NULL, default now()
+
+Keys and indexes:
+- PRIMARY KEY (find_id, user_id), enforcing one Like per user and find
+- idx_find_likes_user_id on (user_id)
 
 ## 3) Relationship Cardinality
 
 - finds to find_images: one-to-many
 - finds to find_comments: one-to-many
+- finds to find_likes: one-to-many
 
 Meaning:
 - One find can have zero or more images.
 - One find can have zero or more comments.
+- One find can have zero or more Likes.
 
 ## 4) Integrity Rules Already Enforced
 
-- Primary keys on all three tables.
+- Primary keys on all tables.
 - Foreign keys with cascade delete from child tables to finds.
 - NOT NULL on required fields for API contract consistency.
 - Default timestamps on create.
@@ -112,8 +132,8 @@ Current backend query layer uses these patterns:
 - Nearby queries resolve via cluster_hash.
 
 Current API response shape supports:
-- finds as base records
-- images and comments arrays (currently empty placeholders in query mapping; relation is ready in schema)
+- finds as base records with computed Like and misidentification counts
+- images, comments, and Likes loaded from their related tables
 
 ## 6) Gaps / Next Migration Candidates
 
@@ -132,3 +152,4 @@ Recommended next migration(s):
   - PrivateFindRecord (private mode, location exposed)
 - find_images maps to RecordImageRef list
 - find_comments maps to RecordComment list
+- find_likes and flagged find_comments provide engagement counts; counts are computed by queries, not stored on finds.

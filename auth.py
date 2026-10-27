@@ -258,3 +258,14 @@ async def get_current_user(
     claims = _decode_token(token)
     user_id = _extract_user_id(claims)
     return AuthUser(user_id=user_id, claims=claims)
+
+
+async def get_optional_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> Optional[AuthUser]:
+    if credentials is None:
+        return None
+
+    claims = _decode_token(credentials.credentials)
+    user_id = _extract_user_id(claims)
+    return AuthUser(user_id=user_id, claims=claims)

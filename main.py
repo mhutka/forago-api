@@ -18,7 +18,12 @@ from pydantic import BaseModel, Field, field_validator
 
 from config import settings
 from database import init_db, close_db, run_migrations
-from auth import AuthUser, get_current_user, validate_auth_configuration
+from auth import (
+    AuthUser,
+    get_current_user,
+    get_optional_current_user,
+    validate_auth_configuration,
+)
 from r2_storage import generate_find_image_upload_plans, is_r2_configured
 from version import __version__
 from queries import (
@@ -41,6 +46,7 @@ from queries import (
     resolve_category_ids,
     update_user_profile,
     insert_find_comment,
+    set_find_like,
 )
 
 # ============ LOGGING SETUP ============
@@ -124,10 +130,12 @@ class RecordComment(BaseModel):
     displayNickname: Optional[str] = None
     text: str
     createdAt: datetime
+    isMisidentificationReport: bool = False
 
 
 class CreateCommentRequest(BaseModel):
     text: str
+    isMisidentificationReport: bool = False
 
     @field_validator("text")
     @classmethod
@@ -156,6 +164,14 @@ class PublicFindRecord(BaseModel):
     itemLabels: List[str] = Field(default_factory=list)
     images: List[RecordImageRef] = Field(default_factory=list)
     comments: List[RecordComment] = Field(default_factory=list)
+    likeCount: int = 0
+    likedByMe: bool = False
+    misidentificationCount: int = 0
+
+
+class LikeState(BaseModel):
+    likeCount: int
+    likedByMe: bool
 
 class PrivateFindRecord(PublicFindRecord):
     location: LatLng
@@ -871,6 +887,7 @@ async def get_public_finds(
     period: Optional[str] = None,
     periods: Optional[List[str]] = Query(default=None),
     q: Optional[str] = None,
+    current_user: Optional[AuthUser] = Depends(get_optional_current_user),
 ):
     """
     Get all public finds (visible to all users)
@@ -892,6 +909,7 @@ async def get_public_finds(
                 period=period,
                 periods=periods,
                 search_query=search_query,
+                current_user_id=current_user.user_id if current_user else None,
             )
             return [PublicFindRecord(**r) for r in results_data]
         else:
@@ -940,6 +958,7 @@ async def get_finds_nearby(
     period: Optional[str] = None,
     periods: Optional[List[str]] = Query(default=None),
     q: Optional[str] = None,
+    current_user: Optional[AuthUser] = Depends(get_optional_current_user),
 ):
     """Get finds near a specific cluster"""
     try:
@@ -958,6 +977,7 @@ async def get_finds_nearby(
                 period=period,
                 periods=periods,
                 search_query=search_query,
+                current_user_id=current_user.user_id if current_user else None,
             )
             return [PublicFindRecord(**r) for r in results_data]
         else:
@@ -1194,16 +1214,77 @@ async def create_find_comment(
             find_id=find_id,
             user_id=current_user.user_id,
             text=request.text,
+            is_misidentification_report=request.isMisidentificationReport,
         )
         if comment is None:
             raise HTTPException(status_code=404, detail="Find not found")
         return RecordComment(**comment)
     except HTTPException:
         raise
-    except ValueError:
+    except ValueError as exc:
+        if str(exc) == "misidentification_own_find":
+            raise HTTPException(
+                status_code=403,
+                detail="misidentification_own_find",
+            ) from exc
+        if str(exc) == "misidentification_already_reported":
+            raise HTTPException(
+                status_code=409,
+                detail="misidentification_already_reported",
+            ) from exc
         raise HTTPException(status_code=404, detail="Find not found")
     except Exception as e:
+        if (
+            getattr(e, "sqlstate", None) == "23505"
+            and getattr(e, "constraint_name", None)
+            == "ux_find_comments_one_report_per_user"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="misidentification_already_reported",
+            ) from e
         raise HTTPException(status_code=500, detail=f"Failed to create comment: {str(e)}")
+
+
+async def _change_find_like(
+    find_id: str,
+    liked: bool,
+    current_user: AuthUser,
+) -> LikeState:
+    if settings.data_source_mode != "db":
+        raise HTTPException(
+            status_code=501,
+            detail="Likes are only available in db mode",
+        )
+    try:
+        state = await set_find_like(
+            find_id=find_id,
+            user_id=current_user.user_id,
+            liked=liked,
+        )
+        if state is None:
+            raise HTTPException(status_code=404, detail="Find not found")
+        return LikeState(**state)
+    except ValueError as exc:
+        if str(exc) == "like_own_find":
+            raise HTTPException(status_code=403, detail="like_own_find") from exc
+        raise
+
+
+@app.put("/api/finds/{find_id}/like", response_model=LikeState)
+async def like_find(
+    find_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    return await _change_find_like(find_id, True, current_user)
+
+
+@app.delete("/api/finds/{find_id}/like", response_model=LikeState)
+async def unlike_find(
+    find_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    return await _change_find_like(find_id, False, current_user)
 
 
 @app.post("/api/finds/{find_id}/images/presign", response_model=PresignFindImagesResponse)

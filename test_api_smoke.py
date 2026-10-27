@@ -2,6 +2,7 @@ import importlib
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 from jose import jwt
@@ -67,6 +68,57 @@ def test_create_find_rejects_invalid_period():
 def test_private_endpoint_requires_authentication():
     response = client.get("/api/finds/private")
     assert response.status_code == 401
+
+
+def test_comment_report_flag_defaults_to_false():
+    request = main.CreateCommentRequest(text="Useful note")
+    assert request.isMisidentificationReport is False
+
+
+def test_public_records_accept_optional_auth_for_like_state(monkeypatch):
+    user_id = "00000000-0000-0000-0000-000000000666"
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    query = AsyncMock(return_value=[])
+    monkeypatch.setattr(main, "query_public_finds", query)
+
+    response = client.get("/api/finds/public", headers=auth_headers(user_id))
+
+    assert response.status_code == 200
+    assert query.await_args.kwargs["current_user_id"] == user_id
+
+
+def test_like_endpoint_returns_current_like_state(monkeypatch):
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    set_like = AsyncMock(return_value={"likeCount": 2, "likedByMe": True})
+    monkeypatch.setattr(main, "set_find_like", set_like)
+
+    response = client.put(
+        "/api/finds/find-1/like",
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"likeCount": 2, "likedByMe": True}
+
+
+def test_duplicate_misidentification_report_returns_conflict(monkeypatch):
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    monkeypatch.setattr(
+        main,
+        "insert_find_comment",
+        AsyncMock(side_effect=ValueError("misidentification_already_reported")),
+    )
+
+    response = client.post(
+        "/api/finds/find-1/comments",
+        headers=auth_headers(),
+        json={
+            "text": "Wrong identification",
+            "isMisidentificationReport": True,
+        },
+    )
+
+    assert response.status_code == 409
 
 
 def test_auth_me_returns_subject_from_token():

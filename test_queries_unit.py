@@ -4,7 +4,15 @@ from unittest.mock import AsyncMock
 import pytest
 
 import queries
-from queries import _apply_find_filters, _build_find_record, _period_for_date, insert_find
+from queries import (
+    _apply_find_filters,
+    _build_find_record,
+    _fetch_like_data,
+    _period_for_date,
+    insert_find,
+    insert_find_comment,
+    set_find_like,
+)
 
 
 @pytest.mark.parametrize(
@@ -146,6 +154,123 @@ def test_build_find_record_includes_location_only_when_requested():
     assert "location" not in without_location
 
 
+def test_build_find_record_includes_engagement_counts():
+    row = {
+        "id": "a",
+        "user_id": "u1",
+        "date": datetime(2026, 1, 1),
+        "title": None,
+        "description": "desc",
+        "cluster_hash": "48.14_17.11",
+        "period": "JAN_1",
+        "find_item_id": None,
+    }
+    payload = _build_find_record(
+        row=row,
+        fid="a",
+        nicknames_by_user_id={},
+        images_by_id={"a": []},
+        comments_by_id={
+            "a": [
+                {"isMisidentificationReport": True},
+                {"isMisidentificationReport": False},
+            ]
+        },
+        tag_item_ids_by_find_id={},
+        category_slugs_by_find_id={},
+        item_titles_by_id={},
+        include_location=False,
+        like_data_by_find_id={
+            "a": {"likeCount": 4, "likedByMe": True},
+        },
+    )
+
+    assert payload["likeCount"] == 4
+    assert payload["likedByMe"] is True
+    assert payload["misidentificationCount"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_like_data_maps_counts_and_current_user_state():
+    conn = AsyncMock()
+    conn.fetch.return_value = [
+        {"find_id": "find-1", "like_count": 3, "liked_by_me": True},
+    ]
+
+    result = await _fetch_like_data(conn, ["find-1"], "user-1")
+
+    assert result == {
+        "find-1": {"likeCount": 3, "likedByMe": True},
+    }
+    conn.fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_set_find_like_is_idempotent_and_returns_updated_count(monkeypatch):
+    conn = AsyncMock()
+    conn.fetchrow.return_value = {"user_id": "owner-1"}
+    conn.fetchval.return_value = 2
+    released = AsyncMock()
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    monkeypatch.setattr(queries, "release_db_connection", released)
+
+    result = await set_find_like("find-1", "user-1", True)
+
+    assert result == {"likeCount": 2, "likedByMe": True}
+    assert "ON CONFLICT (find_id, user_id) DO NOTHING" in conn.execute.await_args.args[0]
+    released.assert_awaited_once_with(conn)
+
+
+@pytest.mark.asyncio
+async def test_insert_find_comment_persists_report_flag(monkeypatch):
+    conn = AsyncMock()
+    conn.fetchrow.return_value = {
+        "id": "comment-1",
+        "user_id": "user-1",
+        "text": "Wrong species",
+        "created_at": datetime(2026, 10, 1),
+        "is_misidentification_report": True,
+    }
+    conn.fetchval.return_value = False
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    monkeypatch.setattr(queries, "release_db_connection", AsyncMock())
+    monkeypatch.setattr(
+        queries,
+        "_fetch_display_nicknames",
+        AsyncMock(return_value={"user-1": "tester"}),
+    )
+
+    comment = await insert_find_comment(
+        "find-1",
+        "user-1",
+        "Wrong species",
+        is_misidentification_report=True,
+    )
+
+    assert comment["isMisidentificationReport"] is True
+    assert "is_misidentification_report" in conn.fetchrow.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_insert_find_comment_rejects_second_report(monkeypatch):
+    conn = AsyncMock()
+    conn.fetchval.side_effect = [False, True]
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    released = AsyncMock()
+    monkeypatch.setattr(queries, "release_db_connection", released)
+
+    with pytest.raises(ValueError, match="misidentification_already_reported"):
+        await insert_find_comment(
+            "find-1",
+            "user-1",
+            "Still wrong",
+            is_misidentification_report=True,
+        )
+
+    conn.fetchrow.assert_not_awaited()
+    released.assert_awaited_once_with(conn)
+
+
 @pytest.mark.asyncio
 async def test_insert_find_returns_item_labels(monkeypatch):
     find_id = "find-1"
@@ -269,11 +394,13 @@ async def test_insert_find_comment_populates_required_metadata(monkeypatch):
     query, *params = conn.fetchrow.await_args.args
     assert "language_code" in query
     assert "app_variant_id" in query
-    assert "SELECT $1::uuid, $2::uuid, $3, 'sk', f.app_variant_id" in query
+    assert "SELECT $1::uuid, $2::uuid, $3, 'sk', f.app_variant_id, $4" in query
     assert params == [
         "00000000-0000-0000-0000-000000000888",
         "00000000-0000-0000-0000-000000000777",
         "Test comment",
+        False,
     ]
     assert comment["displayNickname"] == "tester"
+    assert comment["isMisidentificationReport"] is False
     released.assert_awaited_once_with(conn)

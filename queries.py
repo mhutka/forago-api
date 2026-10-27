@@ -44,7 +44,7 @@ async def _fetch_images_and_comments(conn: Any, find_uuids: List[Any]) -> Tuple[
         find_uuids,
     )
     cmt_rows = await conn.fetch(
-        "SELECT id, find_id, user_id, text, created_at "
+        "SELECT id, find_id, user_id, text, created_at, is_misidentification_report "
         "FROM find_comments WHERE find_id = ANY($1::uuid[]) ORDER BY created_at ASC",
         find_uuids,
     )
@@ -69,9 +69,39 @@ async def _fetch_images_and_comments(conn: Any, find_uuids: List[Any]) -> Tuple[
             "displayNickname": comment_nicknames.get(str(r["user_id"])),
             "text": r["text"],
             "createdAt": r["created_at"],
+            "isMisidentificationReport": r["is_misidentification_report"],
         })
 
     return images_by_id, comments_by_id
+
+
+async def _fetch_like_data(
+    conn: Any,
+    find_uuids: List[Any],
+    current_user_id: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Batch-fetch like counts and whether the current user liked each find."""
+    if not find_uuids:
+        return {}
+
+    rows = await conn.fetch(
+        """
+        SELECT find_id, COUNT(*) AS like_count,
+               COALESCE(BOOL_OR(user_id = $2::uuid), FALSE) AS liked_by_me
+        FROM find_likes
+        WHERE find_id = ANY($1::uuid[])
+        GROUP BY find_id
+        """,
+        find_uuids,
+        current_user_id,
+    )
+    return {
+        str(row["find_id"]): {
+            "likeCount": row["like_count"],
+            "likedByMe": row["liked_by_me"],
+        }
+        for row in rows
+    }
 
 
 async def _fetch_find_tag_item_ids(conn: Any, find_uuids: List[Any]) -> Dict[str, List[str]]:
@@ -344,6 +374,7 @@ def _build_find_record(
     category_slugs_by_find_id: Dict[str, List[str]],
     item_titles_by_id: Dict[str, str],
     include_location: bool,
+    like_data_by_find_id: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build API record payload from a DB row."""
     category_slugs = category_slugs_by_find_id.get(fid, [])
@@ -368,6 +399,13 @@ def _build_find_record(
         ],
         "images": images_by_id.get(fid, []),
         "comments": comments_by_id.get(fid, []),
+        "likeCount": (like_data_by_find_id or {}).get(fid, {}).get("likeCount", 0),
+        "likedByMe": (like_data_by_find_id or {}).get(fid, {}).get("likedByMe", False),
+        "misidentificationCount": sum(
+            1
+            for comment in comments_by_id.get(fid, [])
+            if comment.get("isMisidentificationReport", False)
+        ),
     }
 
     if include_location:
@@ -390,6 +428,7 @@ async def query_public_finds(
     item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
     search_query: Optional[str] = None,
+    current_user_id: Optional[str] = None,
 ) -> List[dict]:
     """Query public finds with shared filters."""
     conn = await get_db_connection()
@@ -424,6 +463,7 @@ async def query_public_finds(
         find_uuids = [row["id"] for row in rows]
         owner_ids = [row["user_id"] for row in rows]
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
+        like_data_by_find_id = await _fetch_like_data(conn, find_uuids, current_user_id)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, find_uuids)
         nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
@@ -446,6 +486,7 @@ async def query_public_finds(
                     category_slugs_by_find_id=category_slugs_by_find_id,
                     item_titles_by_id=item_titles_by_id,
                     include_location=False,
+                    like_data_by_find_id=like_data_by_find_id,
                 )
             )
 
@@ -501,6 +542,7 @@ async def query_private_finds(
         find_uuids = [row["id"] for row in rows]
         owner_ids = [row["user_id"] for row in rows]
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
+        like_data_by_find_id = await _fetch_like_data(conn, find_uuids, user_id)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, find_uuids)
         nicknames_by_user_id = await _fetch_display_nicknames(conn, owner_ids)
@@ -523,6 +565,7 @@ async def query_private_finds(
                     category_slugs_by_find_id=category_slugs_by_find_id,
                     item_titles_by_id=item_titles_by_id,
                     include_location=True,
+                    like_data_by_find_id=like_data_by_find_id,
                 )
             )
 
@@ -542,6 +585,7 @@ async def query_finds_nearby(
     item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
     search_query: Optional[str] = None,
+    current_user_id: Optional[str] = None,
 ) -> List[dict]:
     """
     Query finds in a specific cluster (public view, no exact location)
@@ -557,6 +601,7 @@ async def query_finds_nearby(
         item_id=item_id,
         tag_item_ids=tag_item_ids,
         search_query=search_query,
+        current_user_id=current_user_id,
     )
 
 
@@ -648,6 +693,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
 
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
+        like_data_by_find_id = await _fetch_like_data(conn, [row["id"]], user_id)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
@@ -664,6 +710,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
             category_slugs_by_find_id=category_slugs_by_find_id,
             item_titles_by_id=item_titles_by_id,
             include_location=True,
+            like_data_by_find_id=like_data_by_find_id,
         )
     finally:
         await release_db_connection(conn)
@@ -673,10 +720,30 @@ async def insert_find_comment(
     find_id: str,
     user_id: str,
     text: str,
+    is_misidentification_report: bool = False,
 ) -> Optional[dict]:
     """Insert a comment only when its find is publicly visible."""
     conn = await get_db_connection()
     try:
+        if is_misidentification_report:
+            is_owner = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM finds "
+                "WHERE id = $1::uuid AND user_id = $2::uuid AND allow_public = TRUE)",
+                find_id,
+                user_id,
+            )
+            if is_owner:
+                raise ValueError("misidentification_own_find")
+            already_reported = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM find_comments "
+                "WHERE find_id = $1::uuid AND user_id = $2::uuid "
+                "AND is_misidentification_report = TRUE)",
+                find_id,
+                user_id,
+            )
+            if already_reported:
+                raise ValueError("misidentification_already_reported")
+
         row = await conn.fetchrow(
             """
             INSERT INTO find_comments (
@@ -684,16 +751,19 @@ async def insert_find_comment(
                 user_id,
                 text,
                 language_code,
-                app_variant_id
+                app_variant_id,
+                is_misidentification_report
             )
-            SELECT $1::uuid, $2::uuid, $3, 'sk', f.app_variant_id
+            SELECT $1::uuid, $2::uuid, $3, 'sk', f.app_variant_id, $4
             FROM finds f
             WHERE f.id = $1::uuid AND f.allow_public = TRUE
-            RETURNING id, user_id, text, created_at
+              AND (NOT $4 OR f.user_id <> $2::uuid)
+            RETURNING id, user_id, text, created_at, is_misidentification_report
             """,
             find_id,
             user_id,
             text,
+            is_misidentification_report,
         )
         if row is None:
             return None
@@ -705,7 +775,54 @@ async def insert_find_comment(
             "displayNickname": nicknames.get(str(row["user_id"])),
             "text": row["text"],
             "createdAt": row["created_at"],
+            "isMisidentificationReport": row.get(
+                "is_misidentification_report",
+                False,
+            ),
         }
+    finally:
+        await release_db_connection(conn)
+
+
+async def set_find_like(
+    find_id: str,
+    user_id: str,
+    liked: bool,
+) -> Optional[dict]:
+    """Set or remove a like on a public find; return None if it is unavailable."""
+    conn = await get_db_connection()
+    try:
+        find = await conn.fetchrow(
+            "SELECT user_id FROM finds WHERE id = $1::uuid AND allow_public = TRUE",
+            find_id,
+        )
+        if find is None:
+            return None
+        if str(find["user_id"]) == user_id:
+            raise ValueError("like_own_find")
+
+        if liked:
+            await conn.execute(
+                """
+                INSERT INTO find_likes (find_id, user_id)
+                VALUES ($1::uuid, $2::uuid)
+                ON CONFLICT (find_id, user_id) DO NOTHING
+                """,
+                find_id,
+                user_id,
+            )
+        else:
+            await conn.execute(
+                "DELETE FROM find_likes WHERE find_id = $1::uuid AND user_id = $2::uuid",
+                find_id,
+                user_id,
+            )
+
+        like_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM find_likes WHERE find_id = $1::uuid",
+            find_id,
+        )
+        return {"likeCount": like_count, "likedByMe": liked}
     finally:
         await release_db_connection(conn)
 
@@ -961,6 +1078,7 @@ async def update_find(
 
         fid = str(row["id"])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
+        like_data_by_find_id = await _fetch_like_data(conn, [row["id"]], user_id)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, [row["id"]])
         nicknames_by_user_id = await _fetch_display_nicknames(conn, [row["user_id"]])
@@ -977,6 +1095,7 @@ async def update_find(
             category_slugs_by_find_id=category_slugs_by_find_id,
             item_titles_by_id=item_titles_by_id,
             include_location=True,
+            like_data_by_find_id=like_data_by_find_id,
         )
     finally:
         await release_db_connection(conn)
