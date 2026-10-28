@@ -404,3 +404,89 @@ async def test_insert_find_comment_populates_required_metadata(monkeypatch):
     assert comment["displayNickname"] == "tester"
     assert comment["isMisidentificationReport"] is False
     released.assert_awaited_once_with(conn)
+
+
+class _FakeUniqueViolation(Exception):
+    def __init__(self, constraint):
+        super().__init__("duplicate")
+        self.sqlstate = "23505"
+        self.constraint_name = constraint
+
+
+def test_unique_violation_maps_to_group_error_codes():
+    seq = queries._unique_violation_error(_FakeUniqueViolation("ux_finds_group_seq"))
+    pk = queries._unique_violation_error(_FakeUniqueViolation("finds_pkey"))
+
+    assert seq.code == "group_seq_conflict"
+    assert pk.code == "find_id_conflict"
+    assert queries._unique_violation_error(ValueError("x")) is None
+
+
+@pytest.mark.asyncio
+async def test_dissolve_find_group_returns_false_for_non_owner_or_solo(monkeypatch):
+    conn = AsyncMock()
+    conn.fetchval.return_value = None
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    monkeypatch.setattr(queries, "release_db_connection", AsyncMock())
+
+    assert await queries.dissolve_find_group("f", "u") is False
+    conn.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_find_group_members_hides_unavailable_and_coordinates(monkeypatch):
+    from unittest.mock import MagicMock
+
+    owner = "00000000-0000-0000-0000-000000000001"
+    group_id = "00000000-0000-0000-0000-0000000000aa"
+    rows = [
+        {
+            "id": f"00000000-0000-0000-0000-00000000010{i}",
+            "user_id": owner,
+            "date": datetime(2026, 9, 28),
+            "title": "Hríby",
+            "description": f"n{i}",
+            "cluster_hash": "181_70",
+            "latitude": 49.1,
+            "longitude": 19.0,
+            "period": "SEP_2",
+            "find_item_id": None,
+            "group_id": group_id,
+            "group_seq": i,
+            "captured_at": None,
+        }
+        for i in (1, 2)
+    ]
+    conn = AsyncMock()
+    conn.fetchrow.return_value = {
+        "id": rows[0]["id"],
+        "user_id": owner,
+        "group_id": group_id,
+        "allow_public": True,
+    }
+    conn.fetch.return_value = rows
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    monkeypatch.setattr(queries, "release_db_connection", AsyncMock())
+    monkeypatch.setattr(queries, "_fetch_group_counts", AsyncMock(return_value={group_id: 2}))
+    monkeypatch.setattr(queries, "_fetch_images_and_comments", AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(queries, "_fetch_like_data", AsyncMock(return_value={}))
+    monkeypatch.setattr(queries, "_fetch_find_tag_item_ids", AsyncMock(return_value={}))
+    monkeypatch.setattr(queries, "_fetch_find_category_slugs", AsyncMock(return_value={}))
+    monkeypatch.setattr(queries, "_fetch_display_nicknames", AsyncMock(return_value={}))
+    monkeypatch.setattr(queries, "_fetch_item_titles", AsyncMock(return_value={}))
+
+    as_owner = await queries.get_find_group_members(rows[0]["id"], owner)
+    as_other = await queries.get_find_group_members(rows[0]["id"], None)
+
+    assert [m["groupSeq"] for m in as_owner] == [1, 2]
+    assert all(m["groupCount"] == 2 for m in as_owner)
+    assert all("location" in m for m in as_owner)
+    assert all("location" not in m for m in as_other)
+
+    conn.fetchrow.return_value = {
+        "id": rows[0]["id"],
+        "user_id": owner,
+        "group_id": group_id,
+        "allow_public": False,
+    }
+    assert await queries.get_find_group_members(rows[0]["id"], None) is None

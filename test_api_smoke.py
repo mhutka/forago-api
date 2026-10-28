@@ -121,6 +121,94 @@ def test_duplicate_misidentification_report_returns_conflict(monkeypatch):
     assert response.status_code == 409
 
 
+GROUP_FIND_ID = "00000000-0000-0000-0000-0000000000f1"
+
+
+def test_find_group_endpoint_returns_members(monkeypatch):
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    member = {
+        "id": GROUP_FIND_ID,
+        "userId": "00000000-0000-0000-0000-000000000001",
+        "date": "2026-03-25T10:00:00Z",
+        "clusterHash": "48_17",
+        "categoryPaths": [["nature", "forest"]],
+        "description": "x",
+        "groupId": "00000000-0000-0000-0000-0000000000aa",
+        "groupSeq": 1,
+        "groupCount": 2,
+    }
+    mocked = AsyncMock(return_value=[member])
+    monkeypatch.setattr(main, "get_find_group_members", mocked)
+
+    response = client.get(f"/api/finds/{GROUP_FIND_ID}/group")
+
+    assert response.status_code == 200, response.text
+    assert response.json()[0]["groupSeq"] == 1
+    assert mocked.await_args.args[1] is None
+
+
+def test_find_group_endpoint_404_and_invalid_id(monkeypatch):
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    monkeypatch.setattr(main, "get_find_group_members", AsyncMock(return_value=None))
+
+    assert client.get(f"/api/finds/{GROUP_FIND_ID}/group").status_code == 404
+    assert client.get("/api/finds/not-a-uuid/group").status_code == 404
+
+
+def test_dissolve_group_requires_auth_and_maps_result(monkeypatch):
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    dissolve = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "dissolve_find_group", dissolve)
+
+    assert client.delete(f"/api/finds/{GROUP_FIND_ID}/group").status_code == 401
+    assert (
+        client.delete(f"/api/finds/{GROUP_FIND_ID}/group", headers=auth_headers()).status_code
+        == 204
+    )
+
+    dissolve.return_value = False
+    assert (
+        client.delete(f"/api/finds/{GROUP_FIND_ID}/group", headers=auth_headers()).status_code
+        == 404
+    )
+
+
+def test_create_find_rejects_group_seq_without_group():
+    response = client.post(
+        "/api/finds",
+        headers=auth_headers(),
+        json={
+            "date": "2026-03-25T10:00:00Z",
+            "categoryPaths": [["nature", "forest"]],
+            "location": {"latitude": 48.14, "longitude": 17.11},
+            "clusterHash": "48.14_17.11",
+            "tagItemIds": ["unknown-mushrooms"],
+            "period": "MAR_2",
+            "groupSeq": 2,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_create_find_rejects_invalid_group_id():
+    response = client.post(
+        "/api/finds",
+        headers=auth_headers(),
+        json={
+            "date": "2026-03-25T10:00:00Z",
+            "categoryPaths": [["nature", "forest"]],
+            "location": {"latitude": 48.14, "longitude": 17.11},
+            "clusterHash": "48.14_17.11",
+            "tagItemIds": ["unknown-mushrooms"],
+            "period": "MAR_2",
+            "groupId": "nope",
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_auth_me_returns_subject_from_token():
     user_id = "00000000-0000-0000-0000-000000000222"
     response = client.get("/api/auth/me", headers=auth_headers(user_id))

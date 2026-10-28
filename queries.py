@@ -1,9 +1,10 @@
 """Database query helpers for ForaGo Backend."""
 
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 import unicodedata
+import uuid
 from database import get_db_connection, release_db_connection
 
 _ACCENTED_CHARS = "áäčďéěíĺľňóôöŕřšťúůüýž"
@@ -28,6 +29,41 @@ def _period_for_date(value: datetime) -> str:
         "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
     )
     return f"{month_codes[value.month - 1]}_{1 if value.day <= 15 else 2}"
+
+
+MAX_FIND_GROUP_SIZE = 200
+
+_GROUP_COLUMNS = "group_id, group_seq, captured_at"
+# Public queries intentionally never select the exact coordinates.
+_PUBLIC_FIND_COLUMNS = (
+    "id, user_id, date, title, description, cluster_hash, period, "
+    f"find_item_id, created_at, {_GROUP_COLUMNS}"
+)
+_PRIVATE_FIND_COLUMNS = (
+    "id, user_id, date, title, description, cluster_hash, latitude, longitude, "
+    f"period, find_item_id, created_at, {_GROUP_COLUMNS}"
+)
+
+
+class FindGroupError(Exception):
+    """Raised when a find-group operation violates a group rule.
+
+    code is one of: group_not_found, group_full, group_seq_conflict, find_id_conflict.
+    """
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def _unique_violation_error(exc: Exception) -> Optional[FindGroupError]:
+    """Map an asyncpg unique violation on finds to a FindGroupError."""
+    if getattr(exc, "sqlstate", None) != "23505":
+        return None
+    constraint = getattr(exc, "constraint_name", None) or ""
+    if "group_seq" in constraint:
+        return FindGroupError("group_seq_conflict")
+    return FindGroupError("find_id_conflict")
 
 # These models are imported from main.py to avoid circular imports
 # We'll use them in responses
@@ -261,6 +297,51 @@ async def _fetch_display_nicknames(conn: Any, user_ids: List[Any]) -> Dict[str, 
     return {str(row["id"]): row["display_nickname"] for row in rows}
 
 
+async def _fetch_group_counts(conn: Any, rows: List[Any]) -> Dict[str, int]:
+    """Batch-fetch member counts for the groups referenced by the given rows."""
+    group_ids = list({row["group_id"] for row in rows if row.get("group_id") is not None})
+    if not group_ids:
+        return {}
+
+    count_rows = await conn.fetch(
+        "SELECT group_id, COUNT(*) AS member_count FROM finds "
+        "WHERE group_id = ANY($1::uuid[]) GROUP BY group_id",
+        group_ids,
+    )
+    return {str(r["group_id"]): r["member_count"] for r in count_rows}
+
+
+async def _collapse_groups_to_main(
+    conn: Any,
+    rows: List[Any],
+    columns: str,
+    access_clause: str,
+    access_params: Tuple[Any, ...] = (),
+) -> List[Any]:
+    """Replace grouped rows by the main find (lowest group_seq) of their group.
+
+    Filters are evaluated on every find, so a group is returned when any of its
+    members matches. access_clause/access_params repeat the visibility rule
+    (public flag or owner) for the main find; its parameters start at $2.
+    """
+    group_ids = list({row["group_id"] for row in rows if row.get("group_id") is not None})
+    if not group_ids:
+        return list(rows)
+
+    mains = await conn.fetch(
+        f"SELECT {columns} FROM finds f "
+        "WHERE f.group_id = ANY($1::uuid[]) "
+        "AND f.group_seq = (SELECT MIN(g.group_seq) FROM finds g WHERE g.group_id = f.group_id) "
+        f"AND {access_clause}",
+        group_ids,
+        *access_params,
+    )
+    collapsed = {row["id"]: row for row in rows if row.get("group_id") is None}
+    for main_row in mains:
+        collapsed[main_row["id"]] = main_row
+    return sorted(collapsed.values(), key=lambda row: row["date"], reverse=True)
+
+
 def _apply_find_filters(
     query: str,
     params: List[Any],
@@ -375,13 +456,18 @@ def _build_find_record(
     item_titles_by_id: Dict[str, str],
     include_location: bool,
     like_data_by_find_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    group_counts_by_group_id: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Build API record payload from a DB row."""
     category_slugs = category_slugs_by_find_id.get(fid, [])
     item_id = str(row["find_item_id"]) if row.get("find_item_id") is not None else None
     tag_item_ids = tag_item_ids_by_find_id.get(fid, [])
+    group_id = str(row["group_id"]) if row.get("group_id") is not None else None
     payload: Dict[str, Any] = {
         "id": fid,
+        "groupId": group_id,
+        "groupSeq": row.get("group_seq") if group_id else None,
+        "groupCount": (group_counts_by_group_id or {}).get(group_id, 1) if group_id else 1,
         "userId": str(row["user_id"]),
         "displayNickname": nicknames_by_user_id.get(str(row["user_id"])),
         "date": row["date"],
@@ -413,6 +499,7 @@ def _build_find_record(
             "latitude": row["latitude"],
             "longitude": row["longitude"],
         }
+        payload["capturedAt"] = row.get("captured_at")
 
     return payload
 
@@ -433,10 +520,8 @@ async def query_public_finds(
     """Query public finds with shared filters."""
     conn = await get_db_connection()
     try:
-        query = """
-            SELECT 
-                id, user_id, date, title, description, cluster_hash,
-                period, find_item_id, created_at
+        query = f"""
+            SELECT {_PUBLIC_FIND_COLUMNS}
             FROM finds
             WHERE allow_public = TRUE
         """
@@ -459,9 +544,13 @@ async def query_public_finds(
         query += " ORDER BY date DESC"
 
         rows = await conn.fetch(query, *params)
+        rows = await _collapse_groups_to_main(
+            conn, rows, _PUBLIC_FIND_COLUMNS, "f.allow_public = TRUE"
+        )
 
         find_uuids = [row["id"] for row in rows]
         owner_ids = [row["user_id"] for row in rows]
+        group_counts = await _fetch_group_counts(conn, rows)
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
         like_data_by_find_id = await _fetch_like_data(conn, find_uuids, current_user_id)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
@@ -487,6 +576,7 @@ async def query_public_finds(
                     item_titles_by_id=item_titles_by_id,
                     include_location=False,
                     like_data_by_find_id=like_data_by_find_id,
+                    group_counts_by_group_id=group_counts,
                 )
             )
 
@@ -511,11 +601,8 @@ async def query_private_finds(
     """Query private finds for a specific user with shared filters."""
     conn = await get_db_connection()
     try:
-        query = """
-            SELECT 
-                id, user_id, date, title, description, cluster_hash,
-                latitude, longitude, period,
-                find_item_id, created_at
+        query = f"""
+            SELECT {_PRIVATE_FIND_COLUMNS}
             FROM finds
             WHERE user_id = $1
         """
@@ -538,9 +625,13 @@ async def query_private_finds(
         query += " ORDER BY date DESC"
 
         rows = await conn.fetch(query, *params)
+        rows = await _collapse_groups_to_main(
+            conn, rows, _PRIVATE_FIND_COLUMNS, "f.user_id = $2::uuid", (user_id,)
+        )
 
         find_uuids = [row["id"] for row in rows]
         owner_ids = [row["user_id"] for row in rows]
+        group_counts = await _fetch_group_counts(conn, rows)
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
         like_data_by_find_id = await _fetch_like_data(conn, find_uuids, user_id)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
@@ -566,6 +657,7 @@ async def query_private_finds(
                     item_titles_by_id=item_titles_by_id,
                     include_location=True,
                     like_data_by_find_id=like_data_by_find_id,
+                    group_counts_by_group_id=group_counts,
                 )
             )
 
@@ -618,41 +710,141 @@ async def insert_find(
     period: Optional[str] = None,
     find_item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
+    find_id: Optional[str] = None,
+    group_id: Optional[str] = None,
+    start_group: bool = False,
+    group_seq: Optional[int] = None,
+    captured_at: Optional[datetime] = None,
 ) -> dict:
-    """Insert a new find record into database and return API payload."""
+    """Insert a new find record into database and return API payload.
+
+    With group_id/start_group the find joins a group of the same user. A member
+    inherits app variant, title, date, period and categories from the main find
+    (the one with the lowest group_seq); the first find of a group is the main find.
+    """
     derived_period = _period_for_date(date)
+    in_group = group_id is not None or start_group
+    if in_group and captured_at is None:
+        captured_at = datetime.now(timezone.utc)
     conn = await get_db_connection()
     try:
-        query = """
+        insert_sql = f"""
             INSERT INTO finds (
-                user_id, app_variant_id, date, title, description, cluster_hash,
-                latitude, longitude, period, find_item_id
+                id, user_id, app_variant_id, date, title, description, cluster_hash,
+                latitude, longitude, period, find_item_id, group_id, group_seq, captured_at
             )
-            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::uuid)
-            RETURNING id, user_id, date, title, description, cluster_hash,
-                      latitude, longitude, period, find_item_id, created_at
+            VALUES (
+                COALESCE($11::uuid, gen_random_uuid()), $1, $2::uuid, $3, $4, $5, $6,
+                $7, $8, $9, $10::uuid, $12::uuid, $13, $14
+            )
+            RETURNING {_PRIVATE_FIND_COLUMNS}
         """
 
-        row = await conn.fetchrow(
-            query,
-            user_id,
-            app_variant_id,
-            date,
-            title,
-            description,
-            cluster_hash,
-            latitude,
-            longitude,
-            derived_period,
-            find_item_id,
-        )
+        if not in_group:
+            try:
+                row = await conn.fetchrow(
+                    insert_sql,
+                    user_id,
+                    app_variant_id,
+                    date,
+                    title,
+                    description,
+                    cluster_hash,
+                    latitude,
+                    longitude,
+                    derived_period,
+                    find_item_id,
+                    find_id,
+                    None,
+                    None,
+                    captured_at,
+                )
+            except Exception as exc:
+                mapped = _unique_violation_error(exc)
+                if mapped is not None:
+                    raise mapped from exc
+                raise
+        else:
+            try:
+                async with conn.transaction():
+                    if start_group:
+                        group_id = group_id or str(uuid.uuid4())
+                        await conn.execute(
+                            "INSERT INTO find_groups (id, user_id) VALUES ($1::uuid, $2::uuid) "
+                            "ON CONFLICT (id) DO NOTHING",
+                            group_id,
+                            user_id,
+                        )
+                    group = await conn.fetchrow(
+                        "SELECT id, user_id FROM find_groups WHERE id = $1::uuid FOR UPDATE",
+                        group_id,
+                    )
+                    if group is None or str(group["user_id"]) != str(user_id):
+                        raise FindGroupError("group_not_found")
 
-        effective_tag_item_ids = tag_item_ids or ([find_item_id] if find_item_id else [])
-        if effective_tag_item_ids:
-            await _replace_find_tag_items(conn, row["id"], effective_tag_item_ids)
-        await _replace_find_categories(conn, row["id"], category_ids or [])
+                    stats = await conn.fetchrow(
+                        "SELECT COUNT(*) AS member_count, COALESCE(MAX(group_seq), 0) AS max_seq "
+                        "FROM finds WHERE group_id = $1::uuid",
+                        group_id,
+                    )
+                    if stats["member_count"] >= MAX_FIND_GROUP_SIZE:
+                        raise FindGroupError("group_full")
+                    if group_seq is None:
+                        group_seq = stats["max_seq"] + 1
+
+                    main_row = await conn.fetchrow(
+                        "SELECT id, app_variant_id, title, date, period FROM finds "
+                        "WHERE group_id = $1::uuid ORDER BY group_seq ASC LIMIT 1",
+                        group_id,
+                    )
+                    if main_row is not None:
+                        app_variant_id = str(main_row["app_variant_id"])
+                        title = main_row["title"]
+                        date = main_row["date"]
+                        derived_period = main_row["period"]
+                        category_rows = await conn.fetch(
+                            "SELECT category_id FROM find_categories WHERE find_id = $1::uuid",
+                            main_row["id"],
+                        )
+                        category_ids = [str(r["category_id"]) for r in category_rows]
+
+                    row = await conn.fetchrow(
+                        insert_sql,
+                        user_id,
+                        app_variant_id,
+                        date,
+                        title,
+                        description,
+                        cluster_hash,
+                        latitude,
+                        longitude,
+                        derived_period,
+                        find_item_id,
+                        find_id,
+                        group_id,
+                        group_seq,
+                        captured_at,
+                    )
+                    effective_tag_item_ids = tag_item_ids or ([find_item_id] if find_item_id else [])
+                    if effective_tag_item_ids:
+                        await _replace_find_tag_items(conn, row["id"], effective_tag_item_ids)
+                    await _replace_find_categories(conn, row["id"], category_ids or [])
+            except FindGroupError:
+                raise
+            except Exception as exc:
+                mapped = _unique_violation_error(exc)
+                if mapped is not None:
+                    raise mapped from exc
+                raise
+
+        if not in_group:
+            effective_tag_item_ids = tag_item_ids or ([find_item_id] if find_item_id else [])
+            if effective_tag_item_ids:
+                await _replace_find_tag_items(conn, row["id"], effective_tag_item_ids)
+            await _replace_find_categories(conn, row["id"], category_ids or [])
 
         fid = str(row["id"])
+        group_counts = await _fetch_group_counts(conn, [row])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
         category_slugs_by_find_id = await _fetch_find_category_slugs(conn, [row["id"]])
@@ -670,7 +862,20 @@ async def insert_find(
             category_slugs_by_find_id=category_slugs_by_find_id,
             item_titles_by_id=item_titles_by_id,
             include_location=True,
+            group_counts_by_group_id=group_counts,
         )
+    finally:
+        await release_db_connection(conn)
+
+
+async def get_find_owner(find_id: str) -> Optional[str]:
+    """Return the owner user id of a find, or None if it does not exist."""
+    conn = await get_db_connection()
+    try:
+        owner = await conn.fetchval(
+            "SELECT user_id FROM finds WHERE id = $1::uuid", find_id
+        )
+        return str(owner) if owner is not None else None
     finally:
         await release_db_connection(conn)
 
@@ -680,9 +885,8 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
     conn = await get_db_connection()
     try:
         row = await conn.fetchrow(
-            """
-            SELECT id, user_id, date, title, description, cluster_hash,
-                     latitude, longitude, period, find_item_id
+            f"""
+            SELECT {_PRIVATE_FIND_COLUMNS}
             FROM finds WHERE id = $1::uuid AND user_id = $2::uuid
             """,
             find_id,
@@ -692,6 +896,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
             return None
 
         fid = str(row["id"])
+        group_counts = await _fetch_group_counts(conn, [row])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
         like_data_by_find_id = await _fetch_like_data(conn, [row["id"]], user_id)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
@@ -711,9 +916,112 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
             item_titles_by_id=item_titles_by_id,
             include_location=True,
             like_data_by_find_id=like_data_by_find_id,
+            group_counts_by_group_id=group_counts,
         )
     finally:
         await release_db_connection(conn)
+
+
+async def get_find_group_members(
+    find_id: str,
+    viewer_user_id: Optional[str],
+    limit: int = MAX_FIND_GROUP_SIZE,
+    offset: int = 0,
+) -> Optional[List[dict]]:
+    """Return the members of the group a find belongs to, ordered by group_seq.
+
+    The owner receives exact locations; other users only see public groups and
+    never receive coordinates. A find without a group returns just itself.
+    Returns None if the find does not exist or is not visible to the viewer.
+    """
+    conn = await get_db_connection()
+    try:
+        anchor = await conn.fetchrow(
+            "SELECT id, user_id, group_id, allow_public FROM finds WHERE id = $1::uuid",
+            find_id,
+        )
+        if anchor is None:
+            return None
+        is_owner = viewer_user_id is not None and str(anchor["user_id"]) == str(viewer_user_id)
+        if not is_owner and not anchor["allow_public"]:
+            return None
+
+        columns = _PRIVATE_FIND_COLUMNS if is_owner else _PUBLIC_FIND_COLUMNS
+        if anchor["group_id"] is None:
+            rows = await conn.fetch(
+                f"SELECT {columns} FROM finds WHERE id = $1::uuid", find_id
+            )
+        else:
+            rows = await conn.fetch(
+                f"SELECT {columns} FROM finds WHERE group_id = $1::uuid "
+                "ORDER BY group_seq ASC LIMIT $2 OFFSET $3",
+                anchor["group_id"],
+                limit,
+                offset,
+            )
+
+        find_uuids = [row["id"] for row in rows]
+        group_counts = await _fetch_group_counts(conn, rows)
+        images_by_id, comments_by_id = await _fetch_images_and_comments(conn, find_uuids)
+        like_data_by_find_id = await _fetch_like_data(conn, find_uuids, viewer_user_id)
+        tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, find_uuids)
+        category_slugs_by_find_id = await _fetch_find_category_slugs(conn, find_uuids)
+        nicknames_by_user_id = await _fetch_display_nicknames(
+            conn, [row["user_id"] for row in rows]
+        )
+        all_item_ids = [str(row["find_item_id"]) for row in rows if row.get("find_item_id") is not None]
+        for ids in tag_item_ids_by_find_id.values():
+            all_item_ids.extend(ids)
+        item_titles_by_id = await _fetch_item_titles(conn, all_item_ids)
+
+        return [
+            _build_find_record(
+                row=row,
+                fid=str(row["id"]),
+                nicknames_by_user_id=nicknames_by_user_id,
+                images_by_id=images_by_id,
+                comments_by_id=comments_by_id,
+                tag_item_ids_by_find_id=tag_item_ids_by_find_id,
+                category_slugs_by_find_id=category_slugs_by_find_id,
+                item_titles_by_id=item_titles_by_id,
+                include_location=is_owner,
+                like_data_by_find_id=like_data_by_find_id,
+                group_counts_by_group_id=group_counts,
+            )
+            for row in rows
+        ]
+    finally:
+        await release_db_connection(conn)
+
+
+async def dissolve_find_group(find_id: str, user_id: str) -> bool:
+    """Turn the members of the find's group into solo finds and remove the group.
+
+    Returns False if the find is not owned by the user or is not in a group.
+    """
+    conn = await get_db_connection()
+    try:
+        group_id = await conn.fetchval(
+            "SELECT group_id FROM finds WHERE id = $1::uuid AND user_id = $2::uuid",
+            find_id,
+            user_id,
+        )
+        if group_id is None:
+            return False
+        async with conn.transaction():
+            await _dissolve_group(conn, group_id)
+        return True
+    finally:
+        await release_db_connection(conn)
+
+
+async def _dissolve_group(conn: Any, group_id: Any) -> None:
+    await conn.execute(
+        "UPDATE finds SET group_id = NULL, group_seq = NULL, updated_at = now() "
+        "WHERE group_id = $1::uuid",
+        group_id,
+    )
+    await conn.execute("DELETE FROM find_groups WHERE id = $1::uuid", group_id)
 
 
 async def insert_find_comment(
@@ -1010,9 +1318,33 @@ async def update_find(
     find_item_id: Optional[str] = None,
     tag_item_ids: Optional[List[str]] = None,
 ) -> Optional[dict]:
-    """Update mutable fields of a find. Returns None if find does not exist."""
+    """Update mutable fields of a find. Returns None if find does not exist.
+
+    Edits of the main find of a group (title, date, period, categories) are copied
+    to the other members; a member cannot change those inherited fields itself.
+    """
     conn = await get_db_connection()
     try:
+        group_info = await conn.fetchrow(
+            """
+            SELECT f.group_id,
+                   (f.group_id IS NOT NULL AND f.group_seq = (
+                       SELECT MIN(g.group_seq) FROM finds g WHERE g.group_id = f.group_id
+                   )) AS is_main
+            FROM finds f
+            WHERE f.id = $1::uuid AND f.user_id = $2::uuid
+            """,
+            find_id,
+            user_id,
+        )
+        if group_info is None:
+            return None
+        group_id = group_info["group_id"]
+        is_group_main = bool(group_info["is_main"])
+        if group_id is not None and not is_group_main:
+            date = title = period = None
+            category_ids = None
+
         set_parts: List[str] = []
         params: List[Any] = []
 
@@ -1048,35 +1380,63 @@ async def update_find(
         params.append(find_id)
         params.append(user_id)
 
-        if set_parts:
-            query = f"""
-                UPDATE finds SET {', '.join(set_parts)}
-                            WHERE id = ${len(params) - 1}::uuid
-                                AND user_id = ${len(params)}::uuid
-                RETURNING id, user_id, date, title, description, cluster_hash,
-                          latitude, longitude, period, find_item_id
-            """
-            row = await conn.fetchrow(query, *params)
-        else:
-            row = await conn.fetchrow(
+        async def _write() -> Optional[Any]:
+            if set_parts:
+                query = f"""
+                    UPDATE finds SET {', '.join(set_parts)}
+                                WHERE id = ${len(params) - 1}::uuid
+                                    AND user_id = ${len(params)}::uuid
+                    RETURNING {_PRIVATE_FIND_COLUMNS}
                 """
-                SELECT id, user_id, date, title, description, cluster_hash,
-                       latitude, longitude, period, find_item_id
-                FROM finds
-                WHERE id = $1::uuid AND user_id = $2::uuid
-                """,
-                find_id,
-                user_id,
-            )
+                updated = await conn.fetchrow(query, *params)
+            else:
+                updated = await conn.fetchrow(
+                    f"""
+                    SELECT {_PRIVATE_FIND_COLUMNS}
+                    FROM finds
+                    WHERE id = $1::uuid AND user_id = $2::uuid
+                    """,
+                    find_id,
+                    user_id,
+                )
+            if updated is None:
+                return None
+
+            if tag_item_ids is not None:
+                await _replace_find_tag_items(conn, updated["id"], tag_item_ids)
+            if category_ids is not None:
+                await _replace_find_categories(conn, updated["id"], category_ids)
+
+            if group_id is not None and is_group_main:
+                await conn.execute(
+                    "UPDATE finds SET title = $2, date = $3, period = $4, updated_at = now() "
+                    "WHERE group_id = $1::uuid AND id <> $5::uuid",
+                    group_id,
+                    updated["title"],
+                    updated["date"],
+                    updated["period"],
+                    updated["id"],
+                )
+                if category_ids is not None:
+                    members = await conn.fetch(
+                        "SELECT id FROM finds WHERE group_id = $1::uuid AND id <> $2::uuid",
+                        group_id,
+                        updated["id"],
+                    )
+                    for member in members:
+                        await _replace_find_categories(conn, member["id"], category_ids)
+            return updated
+
+        if group_id is not None:
+            async with conn.transaction():
+                row = await _write()
+        else:
+            row = await _write()
         if row is None:
             return None
 
-        if tag_item_ids is not None:
-            await _replace_find_tag_items(conn, row["id"], tag_item_ids)
-        if category_ids is not None:
-            await _replace_find_categories(conn, row["id"], category_ids)
-
         fid = str(row["id"])
+        group_counts = await _fetch_group_counts(conn, [row])
         images_by_id, comments_by_id = await _fetch_images_and_comments(conn, [row["id"]])
         like_data_by_find_id = await _fetch_like_data(conn, [row["id"]], user_id)
         tag_item_ids_by_find_id = await _fetch_find_tag_item_ids(conn, [row["id"]])
@@ -1096,19 +1456,46 @@ async def update_find(
             item_titles_by_id=item_titles_by_id,
             include_location=True,
             like_data_by_find_id=like_data_by_find_id,
+            group_counts_by_group_id=group_counts,
         )
     finally:
         await release_db_connection(conn)
 
 
 async def delete_find(find_id: str, user_id: str) -> bool:
-    """Delete a find by ID. Returns True if a row was deleted."""
+    """Delete a find by ID. Returns True if a row was deleted.
+
+    Deleting a find from a group keeps the group consistent: the next lowest
+    group_seq becomes the main find, and a group left with a single find is dissolved.
+    """
     conn = await get_db_connection()
     try:
-        result = await conn.execute(
-            "DELETE FROM finds WHERE id = $1::uuid AND user_id = $2::uuid", find_id, user_id
+        group_id = await conn.fetchval(
+            "SELECT group_id FROM finds WHERE id = $1::uuid AND user_id = $2::uuid",
+            find_id,
+            user_id,
         )
-        return result == "DELETE 1"
+        if group_id is None:
+            result = await conn.execute(
+                "DELETE FROM finds WHERE id = $1::uuid AND user_id = $2::uuid", find_id, user_id
+            )
+            return result == "DELETE 1"
+
+        async with conn.transaction():
+            await conn.fetchrow(
+                "SELECT id FROM find_groups WHERE id = $1::uuid FOR UPDATE", group_id
+            )
+            result = await conn.execute(
+                "DELETE FROM finds WHERE id = $1::uuid AND user_id = $2::uuid", find_id, user_id
+            )
+            if result != "DELETE 1":
+                return False
+            remaining = await conn.fetchval(
+                "SELECT COUNT(*) FROM finds WHERE group_id = $1::uuid", group_id
+            )
+            if remaining <= 1:
+                await _dissolve_group(conn, group_id)
+        return True
     finally:
         await release_db_connection(conn)
 
