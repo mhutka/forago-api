@@ -75,7 +75,7 @@ async def _fetch_images_and_comments(conn: Any, find_uuids: List[Any]) -> Tuple[
         return {}, {}
 
     img_rows = await conn.fetch(
-        "SELECT find_id, thumbnail_url, full_url, storage_ref "
+        "SELECT id, find_id, thumbnail_url, full_url, storage_ref "
         "FROM find_images WHERE find_id = ANY($1::uuid[]) AND deleted = FALSE",
         find_uuids,
     )
@@ -92,6 +92,7 @@ async def _fetch_images_and_comments(conn: Any, find_uuids: List[Any]) -> Tuple[
     for r in img_rows:
         fid = str(r["find_id"])
         images_by_id.setdefault(fid, []).append({
+            "id": str(r["id"]),
             "thumbnailUrl": r["thumbnail_url"],
             "fullUrl": r["full_url"],
             "storageRef": r["storage_ref"],
@@ -1133,6 +1134,35 @@ async def insert_find_comment(
         await release_db_connection(conn)
 
 
+async def delete_find_comment(
+    find_id: str,
+    comment_id: str,
+    user_id: str,
+) -> bool:
+    """Soft-delete a comment by its author or the owner of its active find."""
+    conn = await get_db_connection()
+    try:
+        result = await conn.execute(
+            """
+            UPDATE find_comments AS comment
+            SET deleted = TRUE, updated_at = now()
+            FROM finds AS find
+            WHERE comment.id = $1::uuid
+              AND comment.find_id = $2::uuid
+              AND comment.find_id = find.id
+              AND comment.deleted = FALSE
+              AND find.deleted = FALSE
+              AND (comment.user_id = $3::uuid OR find.user_id = $3::uuid)
+            """,
+            comment_id,
+            find_id,
+            user_id,
+        )
+        return result == "UPDATE 1"
+    finally:
+        await release_db_connection(conn)
+
+
 async def set_find_like(
     find_id: str,
     user_id: str,
@@ -1330,19 +1360,63 @@ async def insert_find_images(find_id: str, images: List[dict]) -> List[dict]:
 
     conn = await get_db_connection()
     try:
+        saved_images = []
         async with conn.transaction():
             for image in images:
-                await conn.execute(
+                row = await conn.fetchrow(
                     """
                     INSERT INTO find_images (find_id, thumbnail_url, full_url, storage_ref)
                     VALUES ($1::uuid, $2, $3, $4)
+                    RETURNING id
                     """,
                     find_id,
                     image["thumbnailUrl"],
                     image["fullUrl"],
                     image.get("storageRef"),
                 )
-        return images
+                saved_images.append({**image, "id": str(row["id"])})
+        return saved_images
+    finally:
+        await release_db_connection(conn)
+
+
+async def soft_delete_find_image(
+    find_id: str,
+    image_id: str,
+    user_id: str,
+) -> Optional[dict]:
+    """Mark an image deleted and return its storage ref for R2 cleanup.
+
+    Already-deleted images are returned as well so a failed R2 cleanup can be
+    retried safely by the owner.
+    """
+    conn = await get_db_connection()
+    try:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT image.storage_ref
+                FROM find_images AS image
+                JOIN finds AS find ON find.id = image.find_id
+                WHERE image.id = $1::uuid
+                  AND image.find_id = $2::uuid
+                  AND find.user_id = $3::uuid
+                  AND find.deleted = FALSE
+                FOR UPDATE OF image
+                """,
+                image_id,
+                find_id,
+                user_id,
+            )
+            if row is None:
+                return None
+
+            await conn.execute(
+                "UPDATE find_images SET deleted = TRUE "
+                "WHERE id = $1::uuid AND deleted = FALSE",
+                image_id,
+            )
+            return {"storageRef": row["storage_ref"]}
     finally:
         await release_db_connection(conn)
 

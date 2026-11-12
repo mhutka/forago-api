@@ -9,10 +9,13 @@ from queries import (
     _build_find_record,
     _fetch_images_and_comments,
     _fetch_like_data,
+    delete_find_comment,
     delete_find,
     _period_for_date,
     insert_find,
     insert_find_comment,
+    insert_find_images,
+    soft_delete_find_image,
     set_find_like,
 )
 
@@ -257,6 +260,75 @@ async def test_delete_find_soft_deletes_active_solo_find(monkeypatch):
 
     assert "deleted = FALSE" in conn.fetchval.await_args.args[0]
     assert "UPDATE finds SET deleted = TRUE" in conn.execute.await_args.args[0]
+    released.assert_awaited_once_with(conn)
+
+
+@pytest.mark.asyncio
+async def test_delete_find_comment_soft_deletes_for_author_or_find_owner(monkeypatch):
+    conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 1"
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    released = AsyncMock()
+    monkeypatch.setattr(queries, "release_db_connection", released)
+
+    assert await delete_find_comment("find-1", "comment-1", "user-1") is True
+
+    query = conn.execute.await_args.args[0]
+    assert "comment.deleted = FALSE" in query
+    assert "find.deleted = FALSE" in query
+    assert "comment.user_id = $3::uuid OR find.user_id = $3::uuid" in query
+    assert conn.execute.await_args.args[1:] == ("comment-1", "find-1", "user-1")
+    released.assert_awaited_once_with(conn)
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_find_image_returns_storage_ref_for_retryable_purge(monkeypatch):
+    conn = AsyncMock()
+    conn.transaction = MagicMock(
+        return_value=MagicMock(
+            __aenter__=AsyncMock(),
+            __aexit__=AsyncMock(return_value=False),
+        )
+    )
+    conn.fetchrow.return_value = {"storage_ref": "finds/user/find/image"}
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    released = AsyncMock()
+    monkeypatch.setattr(queries, "release_db_connection", released)
+
+    image = await soft_delete_find_image("find-1", "image-1", "user-1")
+
+    assert image == {"storageRef": "finds/user/find/image"}
+    assert "find.user_id = $3::uuid" in conn.fetchrow.await_args.args[0]
+    assert "find.deleted = FALSE" in conn.fetchrow.await_args.args[0]
+    assert "SET deleted = TRUE" in conn.execute.await_args.args[0]
+    released.assert_awaited_once_with(conn)
+
+
+@pytest.mark.asyncio
+async def test_insert_find_images_returns_database_ids(monkeypatch):
+    conn = AsyncMock()
+    conn.transaction = MagicMock(
+        return_value=MagicMock(
+            __aenter__=AsyncMock(),
+            __aexit__=AsyncMock(return_value=False),
+        )
+    )
+    conn.fetchrow.return_value = {"id": "image-1"}
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    released = AsyncMock()
+    monkeypatch.setattr(queries, "release_db_connection", released)
+
+    images = [
+        {
+            "thumbnailUrl": "https://example.test/thumb.jpg",
+            "fullUrl": "https://example.test/full.jpg",
+            "storageRef": "finds/user/find/image",
+        }
+    ]
+    saved = await insert_find_images("find-1", images)
+
+    assert saved == [{**images[0], "id": "image-1"}]
+    assert "RETURNING id" in conn.fetchrow.await_args.args[0]
     released.assert_awaited_once_with(conn)
 
 

@@ -24,7 +24,11 @@ from auth import (
     get_optional_current_user,
     validate_auth_configuration,
 )
-from r2_storage import generate_find_image_upload_plans, is_r2_configured
+from r2_storage import (
+    delete_find_image_objects,
+    generate_find_image_upload_plans,
+    is_r2_configured,
+)
 from version import __version__
 from queries import (
     strip_diacritics,
@@ -46,12 +50,14 @@ from queries import (
     resolve_category_ids,
     update_user_profile,
     insert_find_comment,
+    delete_find_comment,
     set_find_like,
     FindGroupError,
     MAX_FIND_GROUP_SIZE,
     get_find_owner,
     get_find_group_members,
     dissolve_find_group,
+    soft_delete_find_image,
 )
 
 # ============ LOGGING SETUP ============
@@ -125,6 +131,7 @@ class LatLng(BaseModel):
     longitude: float
 
 class RecordImageRef(BaseModel):
+    id: Optional[str] = None
     thumbnailUrl: str
     fullUrl: str
     storageRef: Optional[str] = None
@@ -1439,6 +1446,38 @@ async def create_find_comment(
         raise HTTPException(status_code=500, detail=f"Failed to create comment: {str(e)}")
 
 
+@app.delete(
+    "/api/finds/{find_id}/comments/{comment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_find_comment_route(
+    find_id: str,
+    comment_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Soft-delete a comment by its author or the owner of its find."""
+    try:
+        _validate_uuid_path(find_id)
+        _validate_uuid_path(comment_id)
+        if settings.data_source_mode != "db":
+            raise HTTPException(
+                status_code=501,
+                detail="Comment deletion is only available in db mode",
+            )
+
+        deleted = await delete_find_comment(
+            find_id=find_id,
+            comment_id=comment_id,
+            user_id=current_user.user_id,
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Comment not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete comment: {str(e)}")
+
+
 async def _change_find_like(
     find_id: str,
     liked: bool,
@@ -1545,6 +1584,56 @@ async def attach_find_images(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save image metadata: {str(e)}")
+
+
+@app.delete(
+    "/api/finds/{find_id}/images/{image_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_find_image_route(
+    find_id: str,
+    image_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Soft-delete an image owned by the authenticated find owner and purge R2."""
+    try:
+        _validate_uuid_path(find_id)
+        _validate_uuid_path(image_id)
+        if settings.data_source_mode != "db":
+            raise HTTPException(
+                status_code=501,
+                detail="Image deletion is only available in db mode",
+            )
+
+        image = await soft_delete_find_image(
+            find_id=find_id,
+            image_id=image_id,
+            user_id=current_user.user_id,
+        )
+        if image is None:
+            raise HTTPException(status_code=404, detail="Image not found")
+
+        storage_ref = image.get("storageRef")
+        if storage_ref is not None:
+            if not is_r2_configured():
+                raise HTTPException(
+                    status_code=503,
+                    detail="R2 storage is not configured for image deletion",
+                )
+            delete_find_image_objects(
+                user_id=current_user.user_id,
+                find_id=find_id,
+                storage_ref=storage_ref,
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to delete image %s for find %s", image_id, find_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to delete image from storage",
+        ) from e
+
 
 @app.put("/api/finds/{find_id}", response_model=PrivateFindRecord)
 async def update_find(

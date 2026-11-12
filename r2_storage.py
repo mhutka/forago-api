@@ -104,3 +104,25 @@ def generate_find_image_upload_plans(
         )
 
     return plans
+
+
+def delete_find_image_objects(
+    *,
+    user_id: str,
+    find_id: str,
+    storage_ref: str,
+) -> None:
+    """Delete the thumbnail and full-size objects for a known find image."""
+    expected_prefix = f"finds/{user_id}/{find_id}/"
+    if not storage_ref.startswith(expected_prefix):
+        raise ValueError("Invalid storage reference for this find")
+
+    image_key = storage_ref[len(expected_prefix):]
+    if not image_key or any(
+        not ch.isalnum() and ch not in {"-", "_"} for ch in image_key
+    ):
+        raise ValueError("Invalid storage reference for this find")
+
+    client = get_r2_client()
+    client.delete_object(Bucket=R2_BUCKET, Key=f"{storage_ref}_thumb.jpg")
+    client.delete_object(Bucket=R2_BUCKET, Key=f"{storage_ref}_full.jpg")

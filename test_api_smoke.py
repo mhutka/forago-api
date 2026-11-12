@@ -2,7 +2,7 @@ import importlib
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 from jose import jwt
@@ -73,6 +73,78 @@ def test_private_endpoint_requires_authentication():
 def test_comment_report_flag_defaults_to_false():
     request = main.CreateCommentRequest(text="Useful note")
     assert request.isMisidentificationReport is False
+
+
+def test_delete_comment_requires_authentication():
+    response = client.delete(
+        "/api/finds/00000000-0000-0000-0000-000000000001/comments/"
+        "00000000-0000-0000-0000-000000000002",
+    )
+
+    assert response.status_code == 401
+
+
+def test_delete_comment_calls_soft_delete_query(monkeypatch):
+    find_id = "00000000-0000-0000-0000-000000000001"
+    comment_id = "00000000-0000-0000-0000-000000000002"
+    user_id = "00000000-0000-0000-0000-000000000003"
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    delete_comment = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "delete_find_comment", delete_comment)
+
+    response = client.delete(
+        f"/api/finds/{find_id}/comments/{comment_id}",
+        headers=auth_headers(user_id),
+    )
+
+    assert response.status_code == 204
+    delete_comment.assert_awaited_once_with(
+        find_id=find_id,
+        comment_id=comment_id,
+        user_id=user_id,
+    )
+
+
+def test_delete_comment_returns_not_found_without_permission(monkeypatch):
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    monkeypatch.setattr(main, "delete_find_comment", AsyncMock(return_value=False))
+
+    response = client.delete(
+        "/api/finds/00000000-0000-0000-0000-000000000001/comments/"
+        "00000000-0000-0000-0000-000000000002",
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 404
+
+
+def test_delete_image_soft_deletes_and_purges_r2(monkeypatch):
+    find_id = "00000000-0000-0000-0000-000000000001"
+    image_id = "00000000-0000-0000-0000-000000000002"
+    user_id = "00000000-0000-0000-0000-000000000003"
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    monkeypatch.setattr(main, "is_r2_configured", lambda: True)
+    soft_delete = AsyncMock(return_value={"storageRef": f"finds/{user_id}/{find_id}/img"})
+    delete_objects = MagicMock()
+    monkeypatch.setattr(main, "soft_delete_find_image", soft_delete)
+    monkeypatch.setattr(main, "delete_find_image_objects", delete_objects)
+
+    response = client.delete(
+        f"/api/finds/{find_id}/images/{image_id}",
+        headers=auth_headers(user_id),
+    )
+
+    assert response.status_code == 204
+    soft_delete.assert_awaited_once_with(
+        find_id=find_id,
+        image_id=image_id,
+        user_id=user_id,
+    )
+    delete_objects.assert_called_once_with(
+        user_id=user_id,
+        find_id=find_id,
+        storage_ref=f"finds/{user_id}/{find_id}/img",
+    )
 
 
 def test_public_records_accept_optional_auth_for_like_state(monkeypatch):
