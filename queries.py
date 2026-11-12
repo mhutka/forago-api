@@ -76,12 +76,13 @@ async def _fetch_images_and_comments(conn: Any, find_uuids: List[Any]) -> Tuple[
 
     img_rows = await conn.fetch(
         "SELECT find_id, thumbnail_url, full_url, storage_ref "
-        "FROM find_images WHERE find_id = ANY($1::uuid[])",
+        "FROM find_images WHERE find_id = ANY($1::uuid[]) AND deleted = FALSE",
         find_uuids,
     )
     cmt_rows = await conn.fetch(
         "SELECT id, find_id, user_id, text, created_at, is_misidentification_report "
-        "FROM find_comments WHERE find_id = ANY($1::uuid[]) ORDER BY created_at ASC",
+        "FROM find_comments WHERE find_id = ANY($1::uuid[]) AND deleted = FALSE "
+        "ORDER BY created_at ASC",
         find_uuids,
     )
     comment_user_ids = [row["user_id"] for row in cmt_rows]
@@ -305,7 +306,7 @@ async def _fetch_group_counts(conn: Any, rows: List[Any]) -> Dict[str, int]:
 
     count_rows = await conn.fetch(
         "SELECT group_id, COUNT(*) AS member_count FROM finds "
-        "WHERE group_id = ANY($1::uuid[]) GROUP BY group_id",
+        "WHERE group_id = ANY($1::uuid[]) AND deleted = FALSE GROUP BY group_id",
         group_ids,
     )
     return {str(r["group_id"]): r["member_count"] for r in count_rows}
@@ -330,8 +331,9 @@ async def _collapse_groups_to_main(
 
     mains = await conn.fetch(
         f"SELECT {columns} FROM finds f "
-        "WHERE f.group_id = ANY($1::uuid[]) "
-        "AND f.group_seq = (SELECT MIN(g.group_seq) FROM finds g WHERE g.group_id = f.group_id) "
+        "WHERE f.group_id = ANY($1::uuid[]) AND f.deleted = FALSE "
+        "AND f.group_seq = (SELECT MIN(g.group_seq) FROM finds g "
+        "WHERE g.group_id = f.group_id AND g.deleted = FALSE) "
         f"AND {access_clause}",
         group_ids,
         *access_params,
@@ -523,7 +525,7 @@ async def query_public_finds(
         query = f"""
             SELECT {_PUBLIC_FIND_COLUMNS}
             FROM finds
-            WHERE allow_public = TRUE
+            WHERE allow_public = TRUE AND deleted = FALSE
         """
         params: List[Any] = []
         query, params = _apply_find_filters(
@@ -604,7 +606,7 @@ async def query_private_finds(
         query = f"""
             SELECT {_PRIVATE_FIND_COLUMNS}
             FROM finds
-            WHERE user_id = $1
+            WHERE user_id = $1 AND deleted = FALSE
         """
         params: List[Any] = [user_id]
         query, params = _apply_find_filters(
@@ -773,7 +775,8 @@ async def insert_find(
                     if group_anchor_id is not None:
                         anchor = await conn.fetchrow(
                             "SELECT group_id FROM finds "
-                            "WHERE id = $1::uuid AND user_id = $2::uuid FOR UPDATE",
+                            "WHERE id = $1::uuid AND user_id = $2::uuid "
+                            "AND deleted = FALSE FOR UPDATE",
                             group_anchor_id,
                             user_id,
                         )
@@ -789,7 +792,7 @@ async def insert_find(
                             )
                             await conn.execute(
                                 "UPDATE finds SET group_id = $1::uuid, group_seq = 1, updated_at = now() "
-                                "WHERE id = $2::uuid AND user_id = $3::uuid",
+                                "WHERE id = $2::uuid AND user_id = $3::uuid AND deleted = FALSE",
                                 group_id,
                                 group_anchor_id,
                                 user_id,
@@ -810,7 +813,8 @@ async def insert_find(
                         raise FindGroupError("group_not_found")
 
                     stats = await conn.fetchrow(
-                        "SELECT COUNT(*) AS member_count, COALESCE(MAX(group_seq), 0) AS max_seq "
+                        "SELECT COUNT(*) FILTER (WHERE deleted = FALSE) AS member_count, "
+                        "COALESCE(MAX(group_seq), 0) AS max_seq "
                         "FROM finds WHERE group_id = $1::uuid",
                         group_id,
                     )
@@ -821,7 +825,8 @@ async def insert_find(
 
                     main_row = await conn.fetchrow(
                         "SELECT id, app_variant_id, title, date, period, allow_public FROM finds "
-                        "WHERE group_id = $1::uuid ORDER BY group_seq ASC LIMIT 1",
+                        "WHERE group_id = $1::uuid AND deleted = FALSE "
+                        "ORDER BY group_seq ASC LIMIT 1",
                         group_id,
                     )
                     if main_row is not None:
@@ -901,7 +906,8 @@ async def get_find_owner(find_id: str) -> Optional[str]:
     conn = await get_db_connection()
     try:
         owner = await conn.fetchval(
-            "SELECT user_id FROM finds WHERE id = $1::uuid", find_id
+            "SELECT user_id FROM finds WHERE id = $1::uuid AND deleted = FALSE",
+            find_id,
         )
         return str(owner) if owner is not None else None
     finally:
@@ -916,6 +922,7 @@ async def get_find_by_id(find_id: str, user_id: str) -> Optional[dict]:
             f"""
             SELECT {_PRIVATE_FIND_COLUMNS}
             FROM finds WHERE id = $1::uuid AND user_id = $2::uuid
+              AND deleted = FALSE
             """,
             find_id,
             user_id,
@@ -965,7 +972,8 @@ async def get_find_group_members(
     conn = await get_db_connection()
     try:
         anchor = await conn.fetchrow(
-            "SELECT id, user_id, group_id, allow_public FROM finds WHERE id = $1::uuid",
+            "SELECT id, user_id, group_id, allow_public FROM finds "
+            "WHERE id = $1::uuid AND deleted = FALSE",
             find_id,
         )
         if anchor is None:
@@ -977,12 +985,13 @@ async def get_find_group_members(
         columns = _PRIVATE_FIND_COLUMNS if is_owner else _PUBLIC_FIND_COLUMNS
         if anchor["group_id"] is None:
             rows = await conn.fetch(
-                f"SELECT {columns} FROM finds WHERE id = $1::uuid", find_id
+                f"SELECT {columns} FROM finds WHERE id = $1::uuid AND deleted = FALSE",
+                find_id,
             )
         else:
             rows = await conn.fetch(
                 f"SELECT {columns} FROM finds WHERE group_id = $1::uuid "
-                "AND ($4::boolean OR allow_public = TRUE) "
+                "AND deleted = FALSE AND ($4::boolean OR allow_public = TRUE) "
                 "ORDER BY group_seq ASC LIMIT $2 OFFSET $3",
                 anchor["group_id"],
                 limit,
@@ -1032,7 +1041,8 @@ async def dissolve_find_group(find_id: str, user_id: str) -> bool:
     conn = await get_db_connection()
     try:
         group_id = await conn.fetchval(
-            "SELECT group_id FROM finds WHERE id = $1::uuid AND user_id = $2::uuid",
+            "SELECT group_id FROM finds WHERE id = $1::uuid AND user_id = $2::uuid "
+            "AND deleted = FALSE",
             find_id,
             user_id,
         )
@@ -1066,7 +1076,8 @@ async def insert_find_comment(
         if is_misidentification_report:
             is_owner = await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM finds "
-                "WHERE id = $1::uuid AND user_id = $2::uuid AND allow_public = TRUE)",
+                "WHERE id = $1::uuid AND user_id = $2::uuid "
+                "AND allow_public = TRUE AND deleted = FALSE)",
                 find_id,
                 user_id,
             )
@@ -1075,7 +1086,7 @@ async def insert_find_comment(
             already_reported = await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM find_comments "
                 "WHERE find_id = $1::uuid AND user_id = $2::uuid "
-                "AND is_misidentification_report = TRUE)",
+                "AND is_misidentification_report = TRUE AND deleted = FALSE)",
                 find_id,
                 user_id,
             )
@@ -1094,7 +1105,7 @@ async def insert_find_comment(
             )
             SELECT $1::uuid, $2::uuid, $3, 'sk', f.app_variant_id, $4
             FROM finds f
-            WHERE f.id = $1::uuid AND f.allow_public = TRUE
+            WHERE f.id = $1::uuid AND f.allow_public = TRUE AND f.deleted = FALSE
               AND (NOT $4 OR f.user_id <> $2::uuid)
             RETURNING id, user_id, text, created_at, is_misidentification_report
             """,
@@ -1131,7 +1142,8 @@ async def set_find_like(
     conn = await get_db_connection()
     try:
         find = await conn.fetchrow(
-            "SELECT user_id FROM finds WHERE id = $1::uuid AND allow_public = TRUE",
+            "SELECT user_id FROM finds WHERE id = $1::uuid "
+            "AND allow_public = TRUE AND deleted = FALSE",
             find_id,
         )
         if find is None:
@@ -1359,10 +1371,11 @@ async def update_find(
             """
             SELECT f.group_id,
                    (f.group_id IS NOT NULL AND f.group_seq = (
-                       SELECT MIN(g.group_seq) FROM finds g WHERE g.group_id = f.group_id
+                       SELECT MIN(g.group_seq) FROM finds g
+                       WHERE g.group_id = f.group_id AND g.deleted = FALSE
                    )) AS is_main
             FROM finds f
-            WHERE f.id = $1::uuid AND f.user_id = $2::uuid
+            WHERE f.id = $1::uuid AND f.user_id = $2::uuid AND f.deleted = FALSE
             """,
             find_id,
             user_id,
@@ -1416,6 +1429,7 @@ async def update_find(
                     UPDATE finds SET {', '.join(set_parts)}
                                 WHERE id = ${len(params) - 1}::uuid
                                     AND user_id = ${len(params)}::uuid
+                                    AND deleted = FALSE
                     RETURNING {_PRIVATE_FIND_COLUMNS}
                 """
                 updated = await conn.fetchrow(query, *params)
@@ -1424,7 +1438,7 @@ async def update_find(
                     f"""
                     SELECT {_PRIVATE_FIND_COLUMNS}
                     FROM finds
-                    WHERE id = $1::uuid AND user_id = $2::uuid
+                    WHERE id = $1::uuid AND user_id = $2::uuid AND deleted = FALSE
                     """,
                     find_id,
                     user_id,
@@ -1440,7 +1454,7 @@ async def update_find(
             if group_id is not None and is_group_main:
                 await conn.execute(
                     "UPDATE finds SET title = $2, date = $3, period = $4, updated_at = now() "
-                    "WHERE group_id = $1::uuid AND id <> $5::uuid",
+                    "WHERE group_id = $1::uuid AND id <> $5::uuid AND deleted = FALSE",
                     group_id,
                     updated["title"],
                     updated["date"],
@@ -1449,7 +1463,8 @@ async def update_find(
                 )
                 if category_ids is not None:
                     members = await conn.fetch(
-                        "SELECT id FROM finds WHERE group_id = $1::uuid AND id <> $2::uuid",
+                        "SELECT id FROM finds WHERE group_id = $1::uuid "
+                        "AND id <> $2::uuid AND deleted = FALSE",
                         group_id,
                         updated["id"],
                     )
@@ -1493,7 +1508,7 @@ async def update_find(
 
 
 async def delete_find(find_id: str, user_id: str) -> bool:
-    """Delete a find by ID. Returns True if a row was deleted.
+    """Soft-delete a find by ID. Returns True if an active row was deleted.
 
     Deleting a find from a group keeps the group consistent: the next lowest
     group_seq becomes the main find, and a group left with a single find is dissolved.
@@ -1501,27 +1516,36 @@ async def delete_find(find_id: str, user_id: str) -> bool:
     conn = await get_db_connection()
     try:
         group_id = await conn.fetchval(
-            "SELECT group_id FROM finds WHERE id = $1::uuid AND user_id = $2::uuid",
+            "SELECT group_id FROM finds WHERE id = $1::uuid AND user_id = $2::uuid "
+            "AND deleted = FALSE",
             find_id,
             user_id,
         )
         if group_id is None:
             result = await conn.execute(
-                "DELETE FROM finds WHERE id = $1::uuid AND user_id = $2::uuid", find_id, user_id
+                "UPDATE finds SET deleted = TRUE, updated_at = now() "
+                "WHERE id = $1::uuid AND user_id = $2::uuid AND deleted = FALSE",
+                find_id,
+                user_id,
             )
-            return result == "DELETE 1"
+            return result == "UPDATE 1"
 
         async with conn.transaction():
             await conn.fetchrow(
                 "SELECT id FROM find_groups WHERE id = $1::uuid FOR UPDATE", group_id
             )
             result = await conn.execute(
-                "DELETE FROM finds WHERE id = $1::uuid AND user_id = $2::uuid", find_id, user_id
+                "UPDATE finds SET deleted = TRUE, updated_at = now() "
+                "WHERE id = $1::uuid AND user_id = $2::uuid AND deleted = FALSE",
+                find_id,
+                user_id,
             )
-            if result != "DELETE 1":
+            if result != "UPDATE 1":
                 return False
             remaining = await conn.fetchval(
-                "SELECT COUNT(*) FROM finds WHERE group_id = $1::uuid", group_id
+                "SELECT COUNT(*) FROM finds "
+                "WHERE group_id = $1::uuid AND deleted = FALSE",
+                group_id,
             )
             if remaining <= 1:
                 await _dissolve_group(conn, group_id)

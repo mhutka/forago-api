@@ -7,7 +7,9 @@ import queries
 from queries import (
     _apply_find_filters,
     _build_find_record,
+    _fetch_images_and_comments,
     _fetch_like_data,
+    delete_find,
     _period_for_date,
     insert_find,
     insert_find_comment,
@@ -104,6 +106,27 @@ def test_search_ignores_diacritics_in_params_and_sql():
     assert params == ["Jaseň", "jasen"]
     assert "translate(LOWER(" in query
     assert queries.strip_diacritics("Čučoriedka ŽLTÝ ľ") == "cucoriedka zlty l"
+
+
+@pytest.mark.asyncio
+async def test_fetch_images_and_comments_excludes_deleted_rows(monkeypatch):
+    conn = AsyncMock()
+    conn.fetch.return_value = []
+    monkeypatch.setattr(
+        queries, "_fetch_display_nicknames", AsyncMock(return_value={})
+    )
+
+    await _fetch_images_and_comments(conn, ["find-1"])
+
+    statements = [call.args[0] for call in conn.fetch.await_args_list]
+    assert (
+        "FROM find_images WHERE find_id = ANY($1::uuid[]) AND deleted = FALSE"
+        in statements[0]
+    )
+    assert (
+        "FROM find_comments WHERE find_id = ANY($1::uuid[]) AND deleted = FALSE"
+        in statements[1]
+    )
 
 
 def test_build_find_record_includes_location_only_when_requested():
@@ -218,6 +241,22 @@ async def test_set_find_like_is_idempotent_and_returns_updated_count(monkeypatch
 
     assert result == {"likeCount": 2, "likedByMe": True}
     assert "ON CONFLICT (find_id, user_id) DO NOTHING" in conn.execute.await_args.args[0]
+    released.assert_awaited_once_with(conn)
+
+
+@pytest.mark.asyncio
+async def test_delete_find_soft_deletes_active_solo_find(monkeypatch):
+    conn = AsyncMock()
+    conn.fetchval.return_value = None
+    conn.execute.return_value = "UPDATE 1"
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    released = AsyncMock()
+    monkeypatch.setattr(queries, "release_db_connection", released)
+
+    assert await delete_find("find-1", "user-1") is True
+
+    assert "deleted = FALSE" in conn.fetchval.await_args.args[0]
+    assert "UPDATE finds SET deleted = TRUE" in conn.execute.await_args.args[0]
     released.assert_awaited_once_with(conn)
 
 
