@@ -1,5 +1,5 @@
 from datetime import datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -342,6 +342,102 @@ async def test_insert_find_returns_item_labels(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("existing_group", [None, "00000000-0000-0000-0000-0000000000aa"])
+async def test_insert_member_attaches_anchor_and_uses_server_sequence(monkeypatch, existing_group):
+    user = "00000000-0000-0000-0000-000000000001"
+    anchor = "00000000-0000-0000-0000-000000000002"
+    member = "00000000-0000-0000-0000-000000000003"
+    now = datetime(2026, 3, 25)
+    row = {"id": member, "user_id": user, "group_id": existing_group}
+    conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=MagicMock(
+        __aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False)
+    ))
+    conn.fetchrow.side_effect = [
+        {"group_id": existing_group},
+        {"id": existing_group, "user_id": user},
+        {"member_count": 1 if existing_group is None else 2, "max_seq": 1 if existing_group is None else 5},
+        {"id": anchor, "app_variant_id": "variant", "title": "Original", "date": now, "period": "MAR_2", "allow_public": False},
+        row,
+    ]
+    conn.fetch.return_value = [{"category_id": "category"}]
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    monkeypatch.setattr(queries, "release_db_connection", AsyncMock())
+    monkeypatch.setattr(queries, "_replace_find_categories", AsyncMock())
+    monkeypatch.setattr(queries, "_fetch_group_counts", AsyncMock(return_value={}))
+    monkeypatch.setattr(queries, "_fetch_images_and_comments", AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(queries, "_fetch_find_tag_item_ids", AsyncMock(return_value={}))
+    monkeypatch.setattr(queries, "_fetch_find_category_slugs", AsyncMock(return_value={}))
+    monkeypatch.setattr(queries, "_fetch_display_nicknames", AsyncMock(return_value={}))
+    monkeypatch.setattr(queries, "_fetch_record_item_titles", AsyncMock(return_value={}))
+    monkeypatch.setattr(queries, "_build_find_record", MagicMock(return_value={"id": member}))
+
+    await insert_find(
+        user_id=user, app_variant_id="variant", date=now, title="ignored",
+        description="", cluster_hash="c", latitude=1, longitude=2,
+        find_id=member, group_anchor_id=anchor,
+    )
+
+    calls = conn.fetchrow.await_args_list
+    assert "FOR UPDATE" in calls[0].args[0]
+    assert calls[0].args[1:] == (anchor, user)
+    assert calls[-1].args[4] == "Original"
+    assert calls[-1].args[13] == (2 if existing_group is None else 6)
+    assert calls[-1].args[15] is False
+    statements = [call.args[0] for call in conn.execute.await_args_list]
+    assert any("UPDATE finds SET group_id" in sql for sql in statements) is (existing_group is None)
+    assert conn.transaction.return_value.__aexit__.await_args.args == (None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_insert_member_rejects_missing_or_foreign_anchor(monkeypatch):
+    conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=MagicMock(
+        __aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False)
+    ))
+    conn.fetchrow.return_value = None
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    monkeypatch.setattr(queries, "release_db_connection", AsyncMock())
+    with pytest.raises(queries.FindGroupError, match="group_not_found"):
+        await insert_find(
+            user_id="u", app_variant_id="v", date=datetime(2026, 3, 25),
+            title="", description="", cluster_hash="c", latitude=1, longitude=2,
+            group_anchor_id="anchor",
+        )
+    conn.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_insert_member_failure_rolls_back_anchor_conversion(monkeypatch):
+    conn = AsyncMock()
+    transaction = MagicMock(
+        __aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False)
+    )
+    conn.transaction = MagicMock(return_value=transaction)
+    conn.fetchrow.side_effect = [
+        {"group_id": None},
+        {"id": "g", "user_id": "u"},
+        {"member_count": 1, "max_seq": 1},
+        {
+            "id": "anchor", "app_variant_id": "v", "title": "Original",
+            "date": datetime(2026, 3, 25), "period": "MAR_2", "allow_public": False,
+        },
+        RuntimeError("insert failed"),
+    ]
+    conn.fetch.return_value = []
+    monkeypatch.setattr(queries, "get_db_connection", AsyncMock(return_value=conn))
+    monkeypatch.setattr(queries, "release_db_connection", AsyncMock())
+    with pytest.raises(RuntimeError, match="insert failed"):
+        await insert_find(
+            user_id="u", app_variant_id="v", date=datetime(2026, 3, 25),
+            title="", description="", cluster_hash="c", latitude=1, longitude=2,
+            group_anchor_id="anchor",
+        )
+    assert transaction.__aexit__.await_args.args[0] is RuntimeError
+    assert any("UPDATE finds SET group_id" in call.args[0] for call in conn.execute.await_args_list)
+
+
+@pytest.mark.asyncio
 async def test_ensure_user_profile_releases_connection(monkeypatch):
     conn = AsyncMock()
     released = AsyncMock()
@@ -482,6 +578,9 @@ async def test_get_find_group_members_hides_unavailable_and_coordinates(monkeypa
     assert all(m["groupCount"] == 2 for m in as_owner)
     assert all("location" in m for m in as_owner)
     assert all("location" not in m for m in as_other)
+    assert "allow_public = TRUE" in conn.fetch.await_args_list[1].args[0]
+    assert conn.fetch.await_args_list[0].args[4] is True
+    assert conn.fetch.await_args_list[1].args[4] is False
 
     conn.fetchrow.return_value = {
         "id": rows[0]["id"],

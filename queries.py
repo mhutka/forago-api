@@ -715,6 +715,7 @@ async def insert_find(
     start_group: bool = False,
     group_seq: Optional[int] = None,
     captured_at: Optional[datetime] = None,
+    group_anchor_id: Optional[str] = None,
 ) -> dict:
     """Insert a new find record into database and return API payload.
 
@@ -723,7 +724,7 @@ async def insert_find(
     (the one with the lowest group_seq); the first find of a group is the main find.
     """
     derived_period = _period_for_date(date)
-    in_group = group_id is not None or start_group
+    in_group = group_id is not None or start_group or group_anchor_id is not None
     if in_group and captured_at is None:
         captured_at = datetime.now(timezone.utc)
     conn = await get_db_connection()
@@ -731,11 +732,12 @@ async def insert_find(
         insert_sql = f"""
             INSERT INTO finds (
                 id, user_id, app_variant_id, date, title, description, cluster_hash,
-                latitude, longitude, period, find_item_id, group_id, group_seq, captured_at
+                latitude, longitude, period, find_item_id, group_id, group_seq, captured_at,
+                allow_public
             )
             VALUES (
                 COALESCE($11::uuid, gen_random_uuid()), $1, $2::uuid, $3, $4, $5, $6,
-                $7, $8, $9, $10::uuid, $12::uuid, $13, $14
+                $7, $8, $9, $10::uuid, $12::uuid, $13, $14, $15
             )
             RETURNING {_PRIVATE_FIND_COLUMNS}
         """
@@ -758,6 +760,7 @@ async def insert_find(
                     None,
                     None,
                     captured_at,
+                    True,
                 )
             except Exception as exc:
                 mapped = _unique_violation_error(exc)
@@ -767,6 +770,30 @@ async def insert_find(
         else:
             try:
                 async with conn.transaction():
+                    if group_anchor_id is not None:
+                        anchor = await conn.fetchrow(
+                            "SELECT group_id FROM finds "
+                            "WHERE id = $1::uuid AND user_id = $2::uuid FOR UPDATE",
+                            group_anchor_id,
+                            user_id,
+                        )
+                        if anchor is None:
+                            raise FindGroupError("group_not_found")
+                        group_id = anchor["group_id"]
+                        if group_id is None:
+                            group_id = str(uuid.uuid4())
+                            await conn.execute(
+                                "INSERT INTO find_groups (id, user_id) VALUES ($1::uuid, $2::uuid)",
+                                group_id,
+                                user_id,
+                            )
+                            await conn.execute(
+                                "UPDATE finds SET group_id = $1::uuid, group_seq = 1, updated_at = now() "
+                                "WHERE id = $2::uuid AND user_id = $3::uuid",
+                                group_id,
+                                group_anchor_id,
+                                user_id,
+                            )
                     if start_group:
                         group_id = group_id or str(uuid.uuid4())
                         await conn.execute(
@@ -793,7 +820,7 @@ async def insert_find(
                         group_seq = stats["max_seq"] + 1
 
                     main_row = await conn.fetchrow(
-                        "SELECT id, app_variant_id, title, date, period FROM finds "
+                        "SELECT id, app_variant_id, title, date, period, allow_public FROM finds "
                         "WHERE group_id = $1::uuid ORDER BY group_seq ASC LIMIT 1",
                         group_id,
                     )
@@ -824,6 +851,7 @@ async def insert_find(
                         group_id,
                         group_seq,
                         captured_at,
+                        main_row["allow_public"] if main_row is not None else True,
                     )
                     effective_tag_item_ids = tag_item_ids or ([find_item_id] if find_item_id else [])
                     if effective_tag_item_ids:
@@ -954,10 +982,12 @@ async def get_find_group_members(
         else:
             rows = await conn.fetch(
                 f"SELECT {columns} FROM finds WHERE group_id = $1::uuid "
+                "AND ($4::boolean OR allow_public = TRUE) "
                 "ORDER BY group_seq ASC LIMIT $2 OFFSET $3",
                 anchor["group_id"],
                 limit,
                 offset,
+                is_owner,
             )
 
         find_uuids = [row["id"] for row in rows]

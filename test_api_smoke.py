@@ -124,6 +124,79 @@ def test_duplicate_misidentification_report_returns_conflict(monkeypatch):
 GROUP_FIND_ID = "00000000-0000-0000-0000-0000000000f1"
 
 
+def test_add_member_endpoint_passes_anchor_and_allows_optional_species(monkeypatch):
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    monkeypatch.setattr(main, "get_find_owner", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "get_user_active_variant", AsyncMock(return_value={
+        "id": "00000000-0000-0000-0000-0000000000a1",
+        "defaultLanguageCode": "sk",
+    }))
+    insert = AsyncMock(return_value={
+        "id": "00000000-0000-0000-0000-0000000000f2",
+        "userId": "00000000-0000-0000-0000-000000000001",
+        "date": "2026-03-25T10:00:00Z",
+        "categoryPaths": [],
+        "description": "",
+        "clusterHash": "48_17",
+        "location": {"latitude": 48.1, "longitude": 17.1},
+        "groupId": "00000000-0000-0000-0000-0000000000aa",
+        "groupSeq": 2,
+        "groupCount": 2,
+    })
+    monkeypatch.setattr(main, "insert_find", insert)
+    body = {
+        "id": "00000000-0000-0000-0000-0000000000f2",
+        "date": "2026-03-25T10:00:00Z",
+        "description": "",
+        "clusterHash": "48_17",
+        "location": {"latitude": 48.1, "longitude": 17.1},
+    }
+    response = client.post(
+        f"/api/finds/{GROUP_FIND_ID}/group/members", json=body, headers=auth_headers()
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["groupCount"] == 2
+    assert insert.await_args.kwargs["group_anchor_id"] == GROUP_FIND_ID
+    assert insert.await_args.kwargs["group_seq"] is None
+
+
+def test_add_member_retry_is_idempotent_only_for_same_group(monkeypatch):
+    monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
+    monkeypatch.setattr(main, "get_find_owner", AsyncMock(
+        return_value="00000000-0000-0000-0000-000000000001"
+    ))
+    member_id = "00000000-0000-0000-0000-0000000000f2"
+    member = {
+        "id": member_id,
+        "userId": "00000000-0000-0000-0000-000000000001",
+        "date": "2026-03-25T10:00:00Z",
+        "categoryPaths": [],
+        "description": "",
+        "clusterHash": "48_17",
+        "location": {"latitude": 48.1, "longitude": 17.1},
+        "groupId": "00000000-0000-0000-0000-0000000000aa",
+        "groupSeq": 2,
+        "groupCount": 2,
+    }
+    get_find = AsyncMock(side_effect=[member, {"groupId": member["groupId"]}])
+    monkeypatch.setattr(main, "get_find_by_id", get_find)
+    body = {
+        "id": member_id, "date": "2026-03-25T10:00:00Z", "description": "",
+        "clusterHash": "48_17", "location": {"latitude": 48.1, "longitude": 17.1},
+    }
+    response = client.post(
+        f"/api/finds/{GROUP_FIND_ID}/group/members", json=body, headers=auth_headers()
+    )
+    assert response.status_code == 200
+    assert response.json()["id"] == member_id
+
+    get_find.side_effect = [member, {"groupId": None}]
+    response = client.post(
+        f"/api/finds/{GROUP_FIND_ID}/group/members", json=body, headers=auth_headers()
+    )
+    assert response.status_code == 409
+
+
 def test_find_group_endpoint_returns_members(monkeypatch):
     monkeypatch.setattr(main, "settings", SimpleNamespace(data_source_mode="db"))
     member = {
