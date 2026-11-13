@@ -4,6 +4,7 @@
 -- Rows without a Latin name are skipped (the Latin name is the stable canonical key).
 -- Items are created as admin-owned, visible and approved for forago-sk and forago-cz,
 -- with SK/CS translations. Re-running updates existing items instead of duplicating them.
+-- Requires migration 023; user-owned items are not changed by this import.
 --
 -- Usage (psql), one call per CSV:
 --   \set category_slug 'birds'
@@ -139,7 +140,8 @@ SELECT
 FROM target_categories tc
 CROSS JOIN creator cr
 CROSS JOIN tmp_items_clean ic
-ON CONFLICT (category_id, canonical_key) WHERE canonical_key IS NOT NULL
+ON CONFLICT (category_id, canonical_key)
+WHERE canonical_key IS NOT NULL AND owner_type = 'admin'
 DO UPDATE SET
     visibility_state = 'visible',
     approval_state = 'approved',
@@ -152,7 +154,8 @@ WITH item_map AS (
     JOIN categories c ON c.id = ci.category_id
     JOIN app_variants v ON v.id = ci.app_variant_id
     JOIN tmp_items_clean ic ON ic.canonical_key = ci.canonical_key
-    WHERE c.slug = :'category_slug'
+    WHERE ci.owner_type = 'admin'
+      AND c.slug = :'category_slug'
       AND c.parent_category_id IS NULL
       AND v.code IN ('forago-sk', 'forago-cz')
 )

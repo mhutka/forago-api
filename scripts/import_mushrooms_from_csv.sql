@@ -1,4 +1,5 @@
 -- Import mushrooms category items from CSV (idempotent)
+-- Requires migration 023; user-owned items are not changed by this import.
 --
 -- What this does:
 -- 1) Loads raw CSV rows into a temp table.
@@ -26,8 +27,9 @@ CREATE TEMP TABLE tmp_huby_raw (
     mesiace TEXT
 ) ON COMMIT DROP;
 
--- psql meta-command (must be on a single line):
-\copy tmp_huby_raw (slovensky, latinsky, cesky, typ, mesiace) FROM :csv_path WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');
+-- Build the command first because \copy does not interpolate variables.
+\set copy_cmd '\\copy tmp_huby_raw (slovensky, latinsky, cesky, typ, mesiace) FROM ' :'csv_path' ' WITH (FORMAT csv, HEADER true, ENCODING ''UTF8'')'
+:copy_cmd
 CREATE TEMP TABLE tmp_huby_clean AS
 WITH normalized AS (
     SELECT
@@ -222,7 +224,8 @@ SELECT
 FROM mushroom_categories mc
 CROSS JOIN creator cr
 CROSS JOIN tmp_huby_clean hc
-ON CONFLICT (category_id, canonical_key) WHERE canonical_key IS NOT NULL
+ON CONFLICT (category_id, canonical_key)
+WHERE canonical_key IS NOT NULL AND owner_type = 'admin'
 DO UPDATE SET
     visibility_state = 'visible',
     approval_state = 'approved',
@@ -241,7 +244,8 @@ WITH item_map AS (
     JOIN categories c ON c.id = ci.category_id
     JOIN app_variants v ON v.id = ci.app_variant_id
     JOIN tmp_huby_clean hc ON hc.canonical_key = ci.canonical_key
-    WHERE c.slug = 'mushrooms'
+    WHERE ci.owner_type = 'admin'
+      AND c.slug = 'mushrooms'
       AND v.code IN ('forago-sk', 'forago-cz')
 )
 INSERT INTO category_item_translations (
@@ -299,7 +303,8 @@ WITH item_map AS (
     JOIN categories c ON c.id = ci.category_id
     JOIN app_variants v ON v.id = ci.app_variant_id
     JOIN tmp_huby_clean hc ON hc.canonical_key = ci.canonical_key
-    WHERE c.slug = 'mushrooms'
+    WHERE ci.owner_type = 'admin'
+      AND c.slug = 'mushrooms'
       AND v.code IN ('forago-sk', 'forago-cz')
       AND hc.badge_code IS NOT NULL
 ), creator AS (

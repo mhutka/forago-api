@@ -1855,6 +1855,9 @@ async def create_category_item(
                  OR ci.approval_state = 'approved'
                  OR ci.created_by_user_id = $5::uuid
               )
+            ORDER BY (ci.owner_type = 'admin') DESC,
+                     (ci.created_by_user_id = $5::uuid) DESC,
+                     ci.id
             LIMIT 1
             """,
             app_variant_id,
@@ -1891,51 +1894,48 @@ async def create_category_item(
                   AND c.slug = $2
                   AND COALESCE(p.slug, c.slug) = $3
                 LIMIT 1
+            ), upserted AS (
+                INSERT INTO category_items (
+                    app_variant_id,
+                    category_id,
+                    canonical_key,
+                    created_by_user_id,
+                    owner_type,
+                    visibility_state,
+                    approval_state
+                )
+                SELECT $1::uuid, tc.category_id, $4, $5::uuid,
+                       'user', 'visible', 'none'
+                FROM target_category tc
+                ON CONFLICT (category_id, canonical_key, created_by_user_id)
+                    WHERE canonical_key IS NOT NULL AND owner_type = 'user'
+                DO UPDATE SET canonical_key = EXCLUDED.canonical_key
+                    WHERE category_items.visibility_state = 'visible'
+                RETURNING id, category_id
+            ), inserted_translation AS (
+                INSERT INTO category_item_translations
+                    (item_id, language_code, title, description_text)
+                SELECT id, $6, $7, $8 FROM upserted
+                ON CONFLICT (item_id, language_code) DO NOTHING
             )
-            INSERT INTO category_items (
-                app_variant_id,
-                category_id,
-                canonical_key,
-                created_by_user_id,
-                owner_type,
-                visibility_state,
-                approval_state
-            )
-            SELECT
-                $1::uuid,
-                tc.category_id,
-                $4,
-                $5::uuid,
-                'user',
-                'visible',
-                'none'
+            SELECT upserted.id, tc.category_id
             FROM target_category tc
-            RETURNING id, category_id
+            LEFT JOIN upserted ON upserted.category_id = tc.category_id
             """,
             app_variant_id,
             category_slug,
             top_category_slug,
             canonical_key,
             user_id,
-        )
-
-        if inserted is None:
-            raise ValueError("category_item_error_invalid_category")
-
-        await conn.execute(
-            """
-            INSERT INTO category_item_translations (item_id, language_code, title, description_text)
-            VALUES ($1::uuid, $2, $3, $4)
-            ON CONFLICT (item_id, language_code)
-            DO UPDATE SET
-                title = EXCLUDED.title,
-                description_text = EXCLUDED.description_text
-            """,
-            inserted["id"],
             language_code,
             normalized_title,
             normalized_description,
         )
+
+        if inserted is None:
+            raise ValueError("category_item_error_invalid_category")
+        if inserted["id"] is None:
+            raise ValueError("category_item_error_duplicate_inaccessible")
 
         row = await conn.fetchrow(
             """
@@ -1986,12 +1986,6 @@ async def create_category_item(
             "promotedToAdmin": row["promoted_to_admin"],
             "createdByUserId": str(row["created_by_user_id"]),
         }
-    except ValueError:
-        raise
-    except Exception as e:
-        if "ux_category_items_category_canonical_key" in str(e):
-            raise ValueError("category_item_error_duplicate_inaccessible")
-        raise
     finally:
         await release_db_connection(conn)
 

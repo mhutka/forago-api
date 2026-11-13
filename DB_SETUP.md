@@ -11,6 +11,16 @@ python main.py
 
 ## Switch to Database Mode
 
+Category items are unique per category and creator for user-owned items; admin
+items have a separate unique key per category. Apply migration
+`023_scope_category_item_uniqueness.sql` before deploying the matching backend
+or running either category CSV import script. Existing IDs and find references
+remain unchanged. Two users may therefore have distinct IDs for the same name;
+item-ID filters do not automatically match both.
+The PostgreSQL regression test in `test_category_items_db.py` requires `psql`
+and `FORAGO_TEST_DATABASE_URL` pointing to an isolated test database. It creates
+and removes its own schema and runs both CSV import scripts against test data.
+
 ### Step 1: Install PostgreSQL
 
 **Windows:**
